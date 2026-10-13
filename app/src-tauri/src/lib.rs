@@ -129,9 +129,7 @@ async fn run_core(ui: &mut TauriUi) -> Result<()> {
         };
         return app::attach(ui, attach, opts).await;
     }
-    let blokli_url = env("HOPR_CHAT_NETWORK").map(|n| {
-        if n == "rotsee" { settings::ROTSEE_BLOKLI } else { settings::JURA_BLOKLI }.to_string()
-    });
+    let blokli_url = env("HOPR_CHAT_NETWORK").and_then(|n| settings::blokli_url(&n));
     let production = app::Production { home: settings::home()?, nick: env("HOPR_CHAT_NICK"), blokli_url, hops };
     app::production(ui, production, opts).await
 }
@@ -223,6 +221,32 @@ fn shut_down(app: &AppHandle, shared: &Arc<Shared>) -> bool {
     true
 }
 
+/// Points the core at the app sandbox and hands rustls the JVM so blokli's TLS can use
+/// Android's trust store. Runs in setup: tao has initialised `ndk_context`, nothing reads env yet.
+#[cfg(target_os = "android")]
+fn android_init(app: &tauri::App) -> anyhow::Result<()> {
+    use tauri::Manager;
+    let cache = app.path().app_cache_dir()?;
+    std::fs::create_dir_all(&cache)?;
+    std::env::set_var("HOPR_CHAT_HOME", app.path().app_data_dir()?);
+    std::env::set_var("TMPDIR", &cache);
+
+    // Tauri forwards stderr to logcat; hoprd's own file log then stays off (one global subscriber).
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_env_filter("info,rustls_platform_verifier=debug,reqwest=debug,hyper_util=debug")
+        .try_init();
+
+    let ctx = ndk_context::android_context();
+    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) };
+    vm.attach_current_thread(|env| {
+        let context = unsafe { jni::objects::JObject::from_raw(env, ctx.context().cast()) };
+        rustls_platform_verifier::android::init_with_env(env, context)
+    })?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let shared = Arc::new(Shared::default());
@@ -242,6 +266,8 @@ pub fn run() {
         .setup({
             let shared = shared.clone();
             move |app| {
+                #[cfg(target_os = "android")]
+                android_init(app)?;
                 let mut ui = TauriUi { app: app.handle().clone(), shared: shared.clone() };
                 let core_shared = shared.clone();
                 let handle = tauri::async_runtime::spawn(async move {

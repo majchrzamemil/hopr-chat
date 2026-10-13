@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "tauri": "tauri",
-    "bundle": "tauri build --config src-tauri/tauri.bundle.json",
+    "bundle": "tauri build",
     "tauri:second": "cargo run -p hopr-chat-app"
   },
   "dependencies": {

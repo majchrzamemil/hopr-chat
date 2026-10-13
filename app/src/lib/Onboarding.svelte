@@ -139,11 +139,13 @@
   main {
     height: 100%;
     display: grid;
-    place-items: center;
+    grid-template-columns: minmax(0, 560px);
+    place-content: center;
     padding: 24px;
   }
   .card {
     width: min(560px, 100%);
+    min-width: 0;
     background: var(--panel);
     border: 1px solid var(--border);
     border-radius: 16px;
@@ -223,6 +225,9 @@
     font-size: 13px;
   }
   .address {
+    overflow-wrap: anywhere;
+    text-align: left;
+    gap: 10px;
     display: flex;
     justify-content: space-between;
     align-items: center;

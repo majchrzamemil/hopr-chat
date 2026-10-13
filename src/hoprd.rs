@@ -255,3 +255,53 @@ pub fn random_hex(bytes: usize) -> Result<String> {
     std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
+
+/// Runs hoprd inside this process (mobile has no sidecars), on its own runtime: hoprd wants
+/// bigger thread stacks than the host app's. Dropping the returned sender stops the node.
+#[cfg(feature = "embedded")]
+pub async fn embed(
+    keys: edgli::hopr_lib::HoprKeys,
+    config: &Path,
+    api_port: u16,
+    log_path: &Path,
+) -> Result<(Api, tokio::sync::oneshot::Sender<()>)> {
+    use clap::Parser;
+
+    let token = random_hex(16)?;
+    let log = std::fs::File::create(log_path)?;
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::sync::Mutex::new(log))
+        .with_ansi(false)
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .try_init();
+
+    let config = config.to_str().context("config path")?;
+    let port = api_port.to_string();
+    let args = hoprd::cli::CliArgs::try_parse_from([
+        "hoprd", "--configurationFilePath", config, "--api", "--apiHost", "127.0.0.1", "--apiPort", &port, "--apiToken", &token,
+    ])?;
+    let cfg = hoprd::config::HoprdConfig::try_from(args)?;
+
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let (done, mut exited) = tokio::sync::oneshot::channel::<String>();
+    std::thread::Builder::new().name("hoprd".into()).spawn(move || {
+        let result = edgli::hopr_lib::prepare_tokio_runtime(None, None, None).and_then(|rt| {
+            rt.block_on(async {
+                tokio::select! {
+                    r = hoprd::main_inner(cfg, keys) => r,
+                    _ = stopped => Ok(()),
+                }
+            })
+        });
+        let _ = done.send(result.map_or_else(|e| format!("{e:#}"), |_| "stopped".into()));
+    })?;
+
+    let api = Api::new(&format!("http://127.0.0.1:{api_port}"), Some(token));
+    while !api.is_ready().await {
+        if let Ok(why) = exited.try_recv() {
+            bail!("hoprd exited: {why}, log {}:\n{}", log_path.display(), tail(log_path));
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    Ok((api, stop))
+}

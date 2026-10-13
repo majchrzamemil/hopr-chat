@@ -21,6 +21,9 @@
   let adding = $state(false);
   let scroller = $state();
   let composer = $state();
+  /** Phones show either the chat list or one conversation, never both. */
+  const phone = window.matchMedia("(max-width: 700px)");
+  let narrow = $state(phone.matches);
   /** Last unreachable toast per peer, so retries every 15s don't flood the screen. */
   const lastUnreachable = new Map();
 
@@ -50,7 +53,7 @@
   async function loadChats() {
     try {
       [convs, names] = await Promise.all([api.conversations(), api.peerNames()]);
-      if (!selected && chats.length) await open(chats[0].peer);
+      if (!selected && !narrow && chats.length) await open(chats[0].peer);
     } catch (e) {
       toast(String(e), "error");
     }
@@ -67,6 +70,8 @@
   }
 
   async function open(peer) {
+    // A history entry lets Android's back button return to the list.
+    if (narrow && !selected) history.pushState({ chat: peer }, "");
     selected = peer;
     draft = "";
     await loadMessages(true);
@@ -174,7 +179,11 @@
     // Keeps relative times ("5m") fresh.
     const clockTimer = setInterval(() => (convs = [...convs]), 60000);
     const stop = on("chat_event", onEvent);
+    phone.onchange = (e) => (narrow = e.matches);
+    const back = () => (selected = null);
+    window.addEventListener("popstate", back);
     return () => {
+      window.removeEventListener("popstate", back);
       clearInterval(timer);
       clearInterval(clockTimer);
       stop();
@@ -192,7 +201,7 @@
 
 <svelte:window onkeydown={globalKey} />
 
-<div class="layout">
+<div class="layout {narrow ? (selected ? 'narrow show-chat' : 'narrow') : ''}">
   <aside>
     <div class="me">
       <div class="avatar" style:--h={hue(info.nick)}>{initials(info.nick)}</div>
@@ -253,6 +262,7 @@
   <section class="conversation">
     {#if selected}
       <header>
+        {#if narrow}<button class="ghost back" title="Back" onclick={() => (history.state?.chat ? history.back() : (selected = null))}>‹</button>{/if}
         <div class="avatar" style:--h={hue(selected)}>{initials(selected)}</div>
         <div class="who">
           <strong>{short(selected)}</strong>
@@ -305,7 +315,7 @@
           bind:value={draft}
           onkeydown={composerKey}
           rows="1"
-          placeholder="Message {short(selected)}  (Enter to send, Shift+Enter for a new line)"
+          placeholder={narrow ? "Message" : `Message ${short(selected)}  (Enter to send, Shift+Enter for a new line)`}
         ></textarea>
         <button class="primary" disabled={!draft.trim() || sending} onclick={send}>Send</button>
       </footer>
@@ -370,6 +380,21 @@
     height: 100%;
     display: grid;
     grid-template-columns: 300px 1fr;
+  }
+  .layout.narrow {
+    grid-template-columns: 1fr;
+  }
+  .layout.narrow > .conversation,
+  .layout.show-chat > aside {
+    display: none;
+  }
+  .layout.show-chat > .conversation {
+    display: flex;
+  }
+  .back {
+    font-size: 26px;
+    line-height: 1;
+    padding: 0 8px 4px 0;
   }
   aside {
     background: var(--panel);

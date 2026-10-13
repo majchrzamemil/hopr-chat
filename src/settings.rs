@@ -3,8 +3,16 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub const JURA_BLOKLI: &str = "https://blokli.jura.gnosisvpn.io";
-pub const ROTSEE_BLOKLI: &str = "https://blokli.rotsee.hoprnet.link";
+/// `(name, blokli url)`; the first is the default. hopr-lib 5 only talks to v5 networks.
+pub const NETWORKS: [(&str, &str); 3] = [
+    ("piz-palu", "https://blokli-piz-palu.dev.hoprnet.link"),
+    ("jura", "https://blokli.jura.gnosisvpn.io"),
+    ("rotsee", "https://blokli.rotsee.hoprnet.link"),
+];
+
+pub fn blokli_url(network: &str) -> Option<String> {
+    NETWORKS.iter().find(|(name, _)| *name == network).map(|(_, url)| url.to_string())
+}
 const VERSION: u32 = 1;
 
 /// App settings persisted as `settings.toml` in the app home.
@@ -25,7 +33,7 @@ impl Settings {
         Self {
             version: VERSION,
             nick,
-            blokli_url: JURA_BLOKLI.into(),
+            blokli_url: NETWORKS[0].1.into(),
             hops: 1,
             api_port: 3100,
             p2p_port: 9100,

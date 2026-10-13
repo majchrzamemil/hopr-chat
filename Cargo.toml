@@ -12,17 +12,22 @@ rustyline = { version = "14", features = ["derive"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-edgli = { git = "https://github.com/hoprnet/edge-client.git", branch = "release/4.1", default-features = false, features = ["blokli"] }
+edgli = { git = "https://github.com/hoprnet/edge-client.git", branch = "main", default-features = false, features = ["blokli"] }
+hoprd = { git = "https://github.com/hoprnet/hoprd.git", branch = "main", default-features = false, features = ["runtime-tokio", "transport-quic", "session-server"], optional = true }
 serde_yaml = "0.9"
 toml = "0.8"
 hex = "0.4"
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 [features]
+default = ["embedded"]
 # rustyline line-mode frontend, selected at runtime with --cli
 cli = ["dep:rustyline"]
+# hoprd runs inside this process; without it production mode spawns a hoprd binary
+embedded = ["dep:hoprd", "dep:tracing-subscriber"]
 
 [workspace]
 members = [".", "app/src-tauri"]
@@ -34,3 +39,9 @@ debug = "line-tables-only"
 
 [profile.dev.package."*"]
 debug = false
+
+# edgli follows hoprnet `master`, hoprd pins a rev: one hopr-lib so their types are shared.
+# `www.` makes it a distinct source, cargo refuses patches pointing at the patched URL.
+[patch."https://github.com/hoprnet/hoprnet"]
+hopr-lib = { git = "https://www.github.com/hoprnet/hoprnet", rev = "6c66dddd6130cd99c1824b34894438e254b288c4" }
+hopr-utils-session = { git = "https://www.github.com/hoprnet/hoprnet", rev = "6c66dddd6130cd99c1824b34894438e254b288c4" }

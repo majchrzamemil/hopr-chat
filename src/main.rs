@@ -34,7 +34,7 @@ struct ProdArgs {
     #[arg(long)]
     nick: Option<String>,
     /// Saved to settings
-    #[arg(long, value_parser = ["jura", "rotsee"])]
+    #[arg(long, value_parser = settings::NETWORKS.map(|(name, _)| name))]
     network: Option<String>,
     /// Saved to settings; overrides --network
     #[arg(long)]
@@ -134,9 +134,7 @@ async fn dispatch<U: app::Ui>(ui: &mut U, cli: Cli) -> Result<()> {
     match cli.cmd {
         None => {
             let p = cli.prod;
-            let blokli_url = p.blokli_url.or(p.network.map(|n| {
-                if n == "rotsee" { settings::ROTSEE_BLOKLI } else { settings::JURA_BLOKLI }.to_string()
-            }));
+            let blokli_url = p.blokli_url.or(p.network.and_then(|n| settings::blokli_url(&n)));
             let home = match p.home {
                 Some(h) => h,
                 None => settings::home()?,

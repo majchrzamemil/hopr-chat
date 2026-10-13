@@ -3,7 +3,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use edgli::blokli::ChainKeypair;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -88,6 +88,9 @@ pub async fn production<U: Ui>(ui: &mut U, p: Production, opts: ChatOpts) -> Res
     s.blokli_url = p.blokli_url.unwrap_or(s.blokli_url);
     s.hops = p.hops.unwrap_or(s.hops);
     settings::save(&settings_path, &s)?;
+    // TUI and GUI share this home and its node, so only one of them may run at a time.
+    std::net::TcpListener::bind(("127.0.0.1", s.api_port))
+        .with_context(|| format!("port {} is busy: is hopr-chat (TUI or desktop app) already running?", s.api_port))?;
 
     let (keys, password, created) = onboard::identity(&p.home)?;
     let address = onboard::address_of(&keys);
@@ -97,7 +100,11 @@ pub async fn production<U: Ui>(ui: &mut U, p: Production, opts: ChatOpts) -> Res
 
     let log = p.home.join("hoprd.log");
     ui.status(Status::StartingHoprd { log: log.clone() });
-    let (api, _hoprd) = hoprd::launch(&hoprd_bin(&s), &p.home.join(onboard::HOPRD_CONFIG), s.api_port, &log).await?;
+    let config = p.home.join(onboard::HOPRD_CONFIG);
+    #[cfg(feature = "embedded")]
+    let (api, _hoprd) = hoprd::embed(keys.clone(), &config, s.api_port, &log).await?;
+    #[cfg(not(feature = "embedded"))]
+    let (api, _hoprd) = hoprd::launch(&hoprd_bin(&s), &config, s.api_port, &log).await?;
     let cfg = Config {
         nick: s.nick,
         data_dir: p.home,
@@ -157,6 +164,7 @@ fn node_key<U: Ui>(ui: &mut U, hoprd_config: Option<PathBuf>) -> Option<ChainKey
 }
 
 /// Settings, then `HOPR_CHAT_HOPRD_BIN`, then the binary bundled next to ours, then PATH.
+#[cfg(not(feature = "embedded"))]
 fn hoprd_bin(s: &Settings) -> PathBuf {
     s.hoprd_bin
         .clone()
