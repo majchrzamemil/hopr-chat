@@ -1,5 +1,5 @@
-//! Tauri frontend: `TauriUi` implements the same `Ui` trait as the TUI/CLI, so onboarding, hoprd
-//! supervision and the chat core run unchanged; the webview only renders and calls commands.
+//! Tauri frontend: `TauriUi` implements the same `Ui` trait as the TUI, so onboarding, the node and
+//! the chat core run unchanged; the webview only renders and calls commands.
 
 use std::{
     path::PathBuf,
@@ -9,9 +9,9 @@ use std::{
 
 use anyhow::Result;
 use hopr_chat::{
-    app::{self, ChatOpts, SafeChoice, Status, Ui},
+    app::{self, SafeChoice, Status, Ui, DEFAULT_OPTS},
     chat::{compact, Chat, Event},
-    db, settings,
+    db, hoprd, settings,
 };
 use serde::Serialize;
 use tauri::{async_runtime::JoinHandle, AppHandle, Emitter, RunEvent, State};
@@ -98,20 +98,17 @@ impl Ui for TauriUi {
 /// `HOPR_CHAT_DEV_NICK` (localcluster), `HOPR_CHAT_ATTACH_API` (running hoprd), else own node.
 async fn run_core(ui: &mut TauriUi) -> Result<()> {
     let env = |k: &str| std::env::var(k).ok();
-    let opts = ChatOpts { retry_secs: 15, ack_timeout: 30 };
+    let opts = DEFAULT_OPTS;
     let hops = env("HOPR_CHAT_HOPS").and_then(|h| h.parse().ok());
-    let nick_dir = |nick: &str| -> Result<PathBuf> { Ok(PathBuf::from(std::env::var("HOME")?).join(".hopr-chat").join(nick)) };
 
     if let Some(nick) = env("HOPR_CHAT_DEV_NICK") {
         let dev = app::Dev {
-            data_dir: nick_dir(&nick)?,
+            data_dir: settings::nick_dir(&nick)?,
             nick,
             hops: hops.unwrap_or(1),
             localcluster_bin: env("HOPR_CHAT_LOCALCLUSTER_BIN").unwrap_or_else(|| "hoprd-localcluster".into()),
             hoprd_bin: env("HOPR_CHAT_HOPRD_BIN").unwrap_or_else(|| "hoprd".into()),
-            chain_image: env("HOPR_CHAT_CHAIN_IMAGE").unwrap_or_else(|| {
-                "europe-west3-docker.pkg.dev/hoprassociation/docker-images/bloklid-anvil@sha256:75956aede10a71fbb8a46fae05d1aa1caed10ae6ed410c4385df3d565b4fe4fc".into()
-            }),
+            chain_image: env("HOPR_CHAT_CHAIN_IMAGE").unwrap_or_else(|| hoprd::CHAIN_IMAGE.into()),
             cluster_dir: env("HOPR_CHAT_CLUSTER_DIR").map_or("/tmp/hopr-nodes".into(), PathBuf::from),
             node: env("HOPR_CHAT_DEV_NODE").and_then(|n| n.parse().ok()),
         };
@@ -120,7 +117,7 @@ async fn run_core(ui: &mut TauriUi) -> Result<()> {
     if let Some(api) = env("HOPR_CHAT_ATTACH_API") {
         let nick = env("HOPR_CHAT_NICK").unwrap_or_else(|| "me".into());
         let attach = app::Attach {
-            data_dir: nick_dir(&nick)?,
+            data_dir: settings::nick_dir(&nick)?,
             nick,
             hops: hops.unwrap_or(1),
             api,
@@ -182,8 +179,20 @@ async fn add_peer(shared: State<'_, Arc<Shared>>, nick: String, address: String)
 }
 
 #[tauri::command]
-async fn peers(shared: State<'_, Arc<Shared>>) -> CmdResult<Vec<db::Peer>> {
-    chat(&shared)?.peers().await.map_err(err)
+fn peers(shared: State<'_, Arc<Shared>>) -> CmdResult<Vec<db::Peer>> {
+    chat(&shared)?.peers().map_err(err)
+}
+
+/// Deletes the contact and its messages; returns how many messages went.
+#[tauri::command]
+async fn remove_peer(shared: State<'_, Arc<Shared>>, nick: String) -> CmdResult<usize> {
+    chat(&shared)?.remove_peer(&nick).await.map_err(err)
+}
+
+/// `peer: None` deletes every message.
+#[tauri::command]
+fn purge(shared: State<'_, Arc<Shared>>, peer: Option<String>) -> CmdResult<usize> {
+    chat(&shared)?.purge(peer.as_deref()).map_err(err)
 }
 
 #[tauri::command]
@@ -199,8 +208,8 @@ async fn wallet(shared: State<'_, Arc<Shared>>) -> CmdResult<WalletView> {
     })
 }
 
-/// Stops the chat (closing its sessions and hoprd) before the process exits. Onboarding cannot be
-/// interrupted cleanly, so it is aborted; dropping it still kills a hoprd child it spawned.
+/// Stops the chat, then waits for the core to tear hoprd down before the process exits. Onboarding
+/// cannot be interrupted cleanly, so it is aborted.
 fn shut_down(app: &AppHandle, shared: &Arc<Shared>) -> bool {
     let Some(core) = shared.core.lock().unwrap().take() else { return false };
     let running = shared.chat.lock().unwrap().is_some();
@@ -210,7 +219,7 @@ fn shut_down(app: &AppHandle, shared: &Arc<Shared>) -> bool {
         if running {
             shared.shutdown.notify_one();
             let abort = core.inner().abort_handle();
-            if tokio::time::timeout(Duration::from_secs(8), core).await.is_err() {
+            if tokio::time::timeout(Duration::from_secs(15), core).await.is_err() {
                 abort.abort();
             }
         } else {
@@ -232,11 +241,7 @@ fn android_init(app: &tauri::App) -> anyhow::Result<()> {
     std::env::set_var("TMPDIR", &cache);
 
     // Tauri forwards stderr to logcat; hoprd's own file log then stays off (one global subscriber).
-    let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .with_env_filter("info,rustls_platform_verifier=debug,reqwest=debug,hyper_util=debug")
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).with_ansi(false).with_env_filter("info").try_init();
 
     let ctx = ndk_context::android_context();
     let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) };
@@ -261,7 +266,9 @@ pub fn run() {
             send,
             add_peer,
             peers,
-            wallet
+            wallet,
+            purge,
+            remove_peer
         ])
         .setup({
             let shared = shared.clone();

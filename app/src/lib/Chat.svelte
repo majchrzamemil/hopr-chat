@@ -15,7 +15,8 @@
   let search = $state("");
   let draft = $state("");
   let sending = $state(false);
-  let modal = $state(null); // "add" | "wallet" | "share" | null
+  let modal = $state(null); // "add" | "wallet" | "share" | "purge" | "remove" | null
+  let purgePeer = $state(null); // conversation to purge; null = every conversation
   let newNick = $state("");
   let newAddress = $state("");
   let adding = $state(false);
@@ -125,13 +126,44 @@
     }
   }
 
+  function askPurge(peer) {
+    purgePeer = peer;
+    modal = "purge";
+  }
+
+  async function purge() {
+    try {
+      const deleted = await api.purge(purgePeer);
+      modal = null;
+      if (purgePeer === null || purgePeer === selected) msgs = [];
+      convs = await api.conversations();
+      toast(`Deleted ${deleted} message${deleted === 1 ? "" : "s"}`, "success", null, 2500);
+    } catch (e) {
+      toast(String(e), "error");
+    }
+  }
+
+  async function removeContact() {
+    const nick = selected;
+    try {
+      const deleted = await api.removePeer(nick);
+      modal = null;
+      selected = null;
+      msgs = [];
+      if (history.state?.chat) history.back();
+      await loadChats();
+      toast(`Removed ${nick} and ${deleted} message${deleted === 1 ? "" : "s"}`, "success", null, 2500);
+    } catch (e) {
+      toast(String(e), "error");
+    }
+  }
+
   async function onEvent(ev) {
     const { kind, data } = ev;
     if (kind === "message") {
       if (data.peer === selected) await loadMessages(false);
       else {
-        const who = data.nick ?? short(data.peer);
-        toast(`${who}: ${data.text}`, "info", { label: "Open", run: () => open(data.peer) });
+        toast(`${short(data.peer)}: ${data.text}`, "info", { label: "Open", run: () => open(data.peer) });
       }
       convs = await api.conversations();
       names = await api.peerNames();
@@ -221,7 +253,7 @@
     </div>
 
     <div class="search">
-      <input id="search" bind:value={search} placeholder="Search chats  ⌘K" spellcheck="false" />
+      <input id="search" bind:value={search} placeholder={narrow ? "Search chats" : "Search chats  ⌘K"} spellcheck="false" />
       <button class="primary new" title="New chat (⌘N)" onclick={() => (modal = "add")}>＋</button>
     </div>
 
@@ -257,6 +289,7 @@
         <span class="muted">balance unavailable</span>
       {/if}
     </button>
+    <button class="ghost purge-all" onclick={() => askPurge(null)}>Delete all messages</button>
   </aside>
 
   <section class="conversation">
@@ -266,10 +299,14 @@
         <div class="avatar" style:--h={hue(selected)}>{initials(selected)}</div>
         <div class="who">
           <strong>{short(selected)}</strong>
-          {#if selected.startsWith("0x")}
-            <span class="muted small">Not in your peers. Replies go back over their open connection.</span>
+          {#if isAddress(selected)}
+            <span class="muted small">Not in your contacts. Replies go to this node address.</span>
           {/if}
         </div>
+        <button class="ghost clear" title="Delete this conversation's messages" onclick={() => askPurge(selected)}>Clear</button>
+        {#if !isAddress(selected)}
+          <button class="ghost clear" title="Delete this contact and its messages" onclick={() => (modal = "remove")}>Delete contact</button>
+        {/if}
       </header>
 
       <div class="messages" bind:this={scroller}>
@@ -282,13 +319,15 @@
               <div class="bubble">
                 {#if m.dir === "in"}
                   <div class="meta-top">
-                    <span class="nick" style:--h={hue(m.nick ?? m.peer)}>{m.nick ?? short(m.peer)}</span>
+                    <!-- The saved contact name (or the stranger's address), never the nick the sender claims. -->
+                    <span class="nick" style:--h={hue(m.peer)}>{short(m.peer)}</span>
+                    {#if m.nick && isAddress(m.peer)}<span class="muted small">~{m.nick}</span>{/if}
                     {#if m.verified === "verified"}
                       <span class="sig ok" title="Signed by the sender's node key">✓ verified</span>
                     {:else if m.verified === "invalid"}
                       <span class="sig bad" title="Signature does not match the claimed sender">✗ forged?</span>
                     {:else}
-                      <span class="sig" title="Sender did not sign this message">unsigned</span>
+                      <span class="sig" title="Sender did not sign this message (only strangers may skip signing)">unsigned</span>
                     {/if}
                   </div>
                 {/if}
@@ -314,6 +353,7 @@
           bind:this={composer}
           bind:value={draft}
           onkeydown={composerKey}
+          maxlength="4000"
           rows="1"
           placeholder={narrow ? "Message" : `Message ${short(selected)}  (Enter to send, Shift+Enter for a new line)`}
         ></textarea>
@@ -343,6 +383,28 @@
         <button class="primary" disabled={adding || !newNick.trim() || !isAddress(newAddress)}>{adding ? "Checking…" : "Add"}</button>
       </div>
     </form>
+  </Modal>
+{:else if modal === "purge"}
+  <Modal title={purgePeer === null ? "Delete all messages" : `Clear chat with ${short(purgePeer)}`} onclose={() => (modal = null)}>
+    <p>
+      {purgePeer === null ? "Every message in every chat" : "Every message in this chat"} is wiped from this device's database,
+      including queued messages that were not sent yet. Contacts stay. Your peers keep their own copies.
+    </p>
+    <div class="row end">
+      <button class="ghost" onclick={() => (modal = null)}>Cancel</button>
+      <button class="danger" onclick={purge}>Delete</button>
+    </div>
+  </Modal>
+{:else if modal === "remove"}
+  <Modal title={`Delete contact ${selected}`} onclose={() => (modal = null)}>
+    <p>
+      The contact and every message in this chat are wiped from this device, including queued messages that were
+      not sent yet. If they write to you again, they show up by address.
+    </p>
+    <div class="row end">
+      <button class="ghost" onclick={() => (modal = null)}>Cancel</button>
+      <button class="danger" onclick={removeContact}>Delete</button>
+    </div>
   </Modal>
 {:else if modal === "share"}
   <Modal title="Share your address" onclose={() => (modal = null)}>
@@ -521,6 +583,7 @@
   .wallet {
     margin: 10px 14px 14px;
     display: flex;
+    flex-wrap: wrap;
     justify-content: space-between;
     gap: 8px;
     background: var(--panel-2);
@@ -694,10 +757,38 @@
     border-radius: var(--radius);
     padding: 12px 14px;
   }
+  .purge-all {
+    align-self: center;
+    margin: -6px 14px 10px;
+    font-size: 12.5px;
+    color: var(--muted);
+  }
+  .who strong {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .clear {
+    margin-left: 4px;
+    padding: 6px 8px;
+    white-space: nowrap;
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .danger {
+    background: var(--bad);
+    border-color: var(--bad);
+    color: #fff;
+  }
   .kv {
     display: flex;
     justify-content: space-between;
     gap: 12px;
+  }
+  .kv > :last-child {
+    min-width: 0;
+    text-align: right;
+    overflow-wrap: anywhere;
   }
   p.ok {
     color: var(--ok);

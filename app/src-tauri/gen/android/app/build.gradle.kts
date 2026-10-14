@@ -15,20 +15,24 @@ val tauriProperties = Properties().apply {
 }
 
 // Updates install in place (keeping the node identity) only when signed with the same key.
+// Without key.properties (see README) release APKs come out unsigned.
 val keyProperties = Properties().apply {
     val propFile = rootProject.file("key.properties")
     if (propFile.exists()) {
         propFile.inputStream().use { load(it) }
     }
 }
+val releaseKeystore = keyProperties.getProperty("storeFile")
 
 android {
     signingConfigs {
-        create("release") {
-            storeFile = file(keyProperties.getProperty("storeFile"))
-            storePassword = keyProperties.getProperty("storePassword")
-            keyAlias = keyProperties.getProperty("keyAlias")
-            keyPassword = keyProperties.getProperty("keyPassword")
+        if (releaseKeystore != null) {
+            create("release") {
+                storeFile = file(releaseKeystore)
+                storePassword = keyProperties.getProperty("storePassword")
+                keyAlias = keyProperties.getProperty("keyAlias")
+                keyPassword = keyProperties.getProperty("keyPassword")
+            }
         }
     }
     compileSdk = 37
@@ -55,7 +59,7 @@ android {
             }
         }
         getByName("release") {
-            signingConfig = signingConfigs.getByName("release")
+            signingConfigs.findByName("release")?.let { signingConfig = it }
             optimization {
                enable = true
             }

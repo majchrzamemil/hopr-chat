@@ -11,6 +11,10 @@ export const api = {
   addPeer: (nick, address) => invoke("add_peer", { nick, address }),
   peers: () => invoke("peers"),
   wallet: () => invoke("wallet"),
+  /** Deletes one conversation's messages, or all messages when `peer` is null. */
+  purge: (peer) => invoke("purge", { peer }),
+  /** Deletes a contact together with its messages. */
+  removePeer: (nick) => invoke("remove_peer", { nick }),
 };
 
 /** Subscribes to a backend event; returns an unsubscribe function usable in `$effect` cleanup. */

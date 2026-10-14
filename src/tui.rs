@@ -12,7 +12,7 @@ use crossterm::event::{Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyEv
 use futures::StreamExt;
 use hopr_chat::{
     app::{SafeChoice, Status, Ui},
-    chat::{compact, Chat, Event, Wallet},
+    chat::{compact, is_address, Chat, Event, Wallet},
     db,
 };
 use ratatui::{
@@ -31,6 +31,8 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("/peers", "", "known peers and their reachability"),
     ("/balance", "", "node and Safe balances"),
     ("/whoami", "", "your /add line to share with others"),
+    ("/clear", "[all]", "wipe the open chat's messages from disk (all: every chat)"),
+    ("/remove", "[nick]", "delete a contact (or a stranger's chat) and its messages (default: open chat)"),
     ("/help", "", "keys and commands"),
     ("/quit", "", "close sessions and exit"),
 ];
@@ -177,8 +179,7 @@ impl App {
     fn on_event(&mut self, ev: Event) {
         match ev {
             Event::Message(m) if Some(m.peer.as_str()) != self.selected() => {
-                let nick = m.nick.unwrap_or(m.peer);
-                self.toast(format!("new message from {nick}"), Color::Cyan);
+                self.toast(format!("new message from {}", short(&m.peer)), Color::Cyan);
             }
             Event::Unreachable { peer, error } => self.toast(format!("{peer} unreachable, will retry: {error}"), Color::Red),
             Event::Warning(w) => self.toast(w, Color::Red),
@@ -216,9 +217,10 @@ impl App {
             KeyCode::Char('c' | 'q') if ctrl => return true,
             KeyCode::Char('u') if ctrl => self.set_input(""),
             KeyCode::Char('w') if ctrl => {
-                let start = self.input[..self.cursor].iter().rposition(|c| *c != ' ').map_or(0, |end| {
-                    self.input[..end].iter().rposition(|c| *c == ' ').map_or(0, |i| i + 1)
-                });
+                let start = self.input[..self.cursor]
+                    .iter()
+                    .rposition(|c| *c != ' ')
+                    .map_or(0, |end| self.input[..end].iter().rposition(|c| *c == ' ').map_or(0, |i| i + 1));
                 self.input.drain(start..self.cursor);
                 self.cursor = start;
             }
@@ -240,9 +242,7 @@ impl App {
             KeyCode::Right => self.cursor = (self.cursor + 1).min(self.input.len()),
             KeyCode::Home => self.cursor = 0,
             KeyCode::End => self.cursor = self.input.len(),
-            KeyCode::Up if !completions.is_empty() => {
-                self.completion = (self.completion + completions.len() - 1) % completions.len()
-            }
+            KeyCode::Up if !completions.is_empty() => self.completion = (self.completion + completions.len() - 1) % completions.len(),
             KeyCode::Down if !completions.is_empty() => self.completion = (self.completion + 1) % completions.len(),
             KeyCode::Up => self.switch_chat(-1),
             KeyCode::Down => self.switch_chat(1),
@@ -298,13 +298,17 @@ impl App {
             Some("/peers") => {
                 let lines = self
                     .chat
-                    .peers()
-                    .await?
+                    .peers()?
                     .into_iter()
                     .map(|p| {
                         let state = if p.online { "session".green() } else { "idle".dim() };
                         let seen = p.last_seen.map_or("never".into(), ago);
-                        Line::from(vec![format!("{:<12} ", p.nick).cyan(), format!("{} ", p.address).into(), state, format!("  seen {seen}").dim()])
+                        Line::from(vec![
+                            format!("{:<12} ", p.nick).cyan(),
+                            format!("{} ", p.address).into(),
+                            state,
+                            format!("  seen {seen}").dim(),
+                        ])
                     })
                     .collect();
                 self.popup = Some(Popup::Info { title: " peers ".into(), lines });
@@ -319,19 +323,20 @@ impl App {
                     Line::from(""),
                     Line::from(vec!["Safe".bold(), "  holds the wxHOPR that funds channels to relays".dim()]),
                     Line::from(vec!["  funds     ".dim(), compact(&w.safe_hopr).into()]),
-                    Line::from(vec!["  allowance ".dim(), compact(&w.safe_allowance).into(), "  (max the channels contract may spend)".dim()]),
+                    Line::from(vec![
+                        "  allowance ".dim(),
+                        compact(&w.safe_allowance).into(),
+                        "  (max the channels contract may spend)".dim(),
+                    ]),
                     Line::from(vec!["  xDai      ".dim(), compact(&w.safe_native).into()]),
                 ];
                 let warnings = w.warnings();
-                if !warnings.is_empty() {
-                    lines.push(Line::from(""));
+                lines.push(Line::from(""));
+                if warnings.is_empty() {
+                    lines.push(Line::from("✓ ready to pay relays".green()));
                 }
                 for (critical, text) in warnings {
                     lines.push(Line::from(if critical { format!("✗ {text}").red().bold() } else { format!("! {text}").yellow() }));
-                }
-                if lines.len() == 8 {
-                    lines.push(Line::from(""));
-                    lines.push(Line::from("✓ ready to pay relays".green()));
                 }
                 self.popup = Some(Popup::Info { title: " balance ".into(), lines });
             }
@@ -342,6 +347,25 @@ impl App {
                     Line::from(format!("/add {} {}", self.chat.nick(), self.chat.me()).green()),
                 ];
                 self.popup = Some(Popup::Info { title: " whoami ".into(), lines });
+            }
+            Some("/clear") => {
+                let peer = match words.next() {
+                    Some("all") => None,
+                    Some(other) => bail!("usage: /clear [all], not {other}"),
+                    None => Some(self.selected().map(str::to_string).ok_or_else(|| anyhow::anyhow!("no chat open"))?),
+                };
+                let deleted = self.chat.purge(peer.as_deref())?;
+                self.reload();
+                self.toast(format!("deleted {deleted} messages"), Color::Green);
+            }
+            Some("/remove") => {
+                let nick = match words.next() {
+                    Some(nick) => nick.to_string(),
+                    None => self.selected().map(str::to_string).ok_or_else(|| anyhow::anyhow!("usage: /remove <nick>"))?,
+                };
+                let deleted = self.chat.remove_peer(&nick).await?;
+                self.reload();
+                self.toast(format!("removed {nick} and {deleted} messages"), Color::Green);
             }
             Some(cmd) if cmd.starts_with('/') => bail!("unknown command {cmd}, press ? for help"),
             Some(_) => {
@@ -487,11 +511,7 @@ impl App {
         let width = inner.width.max(1) as usize;
         let start = (self.cursor + 1).saturating_sub(width);
         let shown: String = self.input[start..].iter().take(width).collect();
-        let text = if self.input.is_empty() {
-            Line::from("type a message, / for commands, ? for help".dim())
-        } else {
-            Line::from(shown)
-        };
+        let text = if self.input.is_empty() { Line::from("type a message, / for commands, ? for help".dim()) } else { Line::from(shown) };
         f.render_widget(Paragraph::new(text).block(block), area);
         if self.popup.is_none() {
             f.set_cursor_position((inner.x + (self.cursor - start) as u16, inner.y));
@@ -528,7 +548,11 @@ impl App {
         let selected = self.completion % completions.len();
         let rows = completions.iter().enumerate().map(|(i, (cmd, args, help))| {
             let row = Row::new(vec![cmd.to_string(), args.to_string(), help.to_string()]);
-            if i == selected { row.style(Style::new().bg(Color::DarkGray).bold()) } else { row }
+            if i == selected {
+                row.style(Style::new().bg(Color::DarkGray).bold())
+            } else {
+                row
+            }
         });
         let table = Table::new(rows, [Constraint::Length(9), Constraint::Length(20), Constraint::Min(10)])
             .block(Block::bordered().border_type(BorderType::Rounded).title(" commands · Tab complete ").border_style(Style::new().cyan()));
@@ -544,7 +568,7 @@ fn draw_help(f: &mut Frame) {
     lines.push(Line::from("Commands".bold().cyan()));
     lines.extend(COMMANDS.iter().map(|(c, a, d)| Line::from(vec![format!("  {c:<9}").yellow(), format!("{a:<20} ").dim(), (*d).into()])));
     lines.push(Line::from(""));
-    lines.push(Line::from("Badges: ✓ signed by sender's node · ? unsigned · ✗ forged".dim()));
+    lines.push(Line::from("Badges: ✓ signed by the sender's node · ? unsigned (only strangers may skip signing)".dim()));
     lines.push(Line::from("Sent: … pending · ✓ sent · ✓✓ delivered".dim()));
     let height = lines.len() as u16 + 4;
     draw_popup(f, " help · Esc to close ", lines, 76, height);
@@ -567,28 +591,35 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     h
 }
 
+/// Incoming lines are labelled with the contact's saved nick (or the stranger's address), never with
+/// the nick the sender claims; a stranger's claimed nick only follows as a dim `~nick`.
 fn msg_line<'a>(m: &'a db::Msg, me: &'a str) -> Line<'a> {
     let time = format!("{:>4} ", ago(m.created)).dim();
+    let text = m.text.replace('\n', " ");
     if m.dir == "out" {
         let status = match m.status.as_str() {
             "delivered" => " ✓✓".green(),
             "sent" => " ✓".dim(),
             _ => " …".yellow(),
         };
-        return Line::from(vec![time, me.green().bold(), " ".into(), m.text.as_str().into(), status]);
+        return Line::from(vec![time, me.green().bold(), " ".into(), text.into(), status]);
     }
     let badge = match m.verified.as_deref() {
         Some("verified") => " ✓".green(),
         Some("invalid") => " ✗ forged?".red().bold(),
         _ => " ?".dim(),
     };
-    let nick = m.nick.as_deref().unwrap_or(&m.peer);
-    Line::from(vec![time, nick.cyan().bold(), badge, " ".into(), m.text.as_str().into()])
+    let mut spans = vec![time, short(&m.peer).cyan().bold()];
+    if let Some(claimed) = m.nick.as_deref().filter(|n| is_address(&m.peer) && !n.is_empty()) {
+        spans.push(format!(" ~{claimed}").dim());
+    }
+    spans.extend([badge, " ".into(), text.into()]);
+    Line::from(spans)
 }
 
 /// Unnamed senders show as their address; keep the list column readable.
 fn short(peer: &str) -> String {
-    if peer.starts_with("0x") && peer.len() > 14 {
+    if peer.starts_with("0x") && peer.len() > 14 && peer.is_ascii() {
         format!("{}…{}", &peer[..8], &peer[peer.len() - 4..])
     } else {
         peer.to_string()

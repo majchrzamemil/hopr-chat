@@ -42,15 +42,14 @@ pub struct Conversation {
 }
 
 pub fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
 }
 
 pub fn open(path: &Path) -> Result<Connection> {
     let db = Connection::open(path)?;
     db.pragma_update(None, "journal_mode", "WAL")?;
+    // Deleted messages are overwritten on disk instead of lingering in free pages.
+    db.pragma_update(None, "secure_delete", "ON")?;
     init(&db)?;
     Ok(db)
 }
@@ -83,59 +82,37 @@ pub fn add_peer(db: &Connection, nick: &str, address: &str) -> Result<()> {
         params![nick, address],
     )?;
     // messages from/to this node stored before it had a nick
-    db.execute(
-        "UPDATE OR IGNORE messages SET peer = ?1 WHERE lower(peer) = lower(?2)",
-        params![nick, address],
-    )?;
+    db.execute("UPDATE OR IGNORE messages SET peer = ?1 WHERE lower(peer) = lower(?2)", params![nick, address])?;
     Ok(())
 }
 
+pub fn remove_peer(db: &Connection, nick: &str) -> Result<bool> {
+    Ok(db.execute("DELETE FROM peers WHERE nick = ?1", params![nick])? > 0)
+}
+
 pub fn peers(db: &Connection) -> Result<Vec<Peer>> {
-    let mut stmt = db.prepare(
-        "SELECT nick, address, last_seen, last_attempt, last_err FROM peers ORDER BY nick",
-    )?;
+    let mut stmt = db.prepare("SELECT nick, address, last_seen, last_attempt, last_err FROM peers ORDER BY nick")?;
     let rows = stmt.query_map([], |r| {
-        Ok(Peer {
-            nick: r.get(0)?,
-            address: r.get(1)?,
-            last_seen: r.get(2)?,
-            last_attempt: r.get(3)?,
-            last_err: r.get(4)?,
-            online: false,
-        })
+        Ok(Peer { nick: r.get(0)?, address: r.get(1)?, last_seen: r.get(2)?, last_attempt: r.get(3)?, last_err: r.get(4)?, online: false })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
 pub fn peer_address(db: &Connection, nick: &str) -> Result<Option<String>> {
-    Ok(db
-        .query_row("SELECT address FROM peers WHERE nick = ?1", [nick], |r| r.get(0))
-        .optional()?)
+    Ok(db.query_row("SELECT address FROM peers WHERE nick = ?1", [nick], |r| r.get(0)).optional()?)
 }
 
 pub fn nick_by_address(db: &Connection, address: &str) -> Result<Option<String>> {
-    Ok(db
-        .query_row(
-            "SELECT nick FROM peers WHERE lower(address) = lower(?1)",
-            [address],
-            |r| r.get(0),
-        )
-        .optional()?)
+    Ok(db.query_row("SELECT nick FROM peers WHERE lower(address) = lower(?1)", [address], |r| r.get(0)).optional()?)
 }
 
 pub fn peer_attempt(db: &Connection, nick: &str, err: Option<String>) -> Result<()> {
-    db.execute(
-        "UPDATE peers SET last_attempt = ?2, last_err = ?3 WHERE nick = ?1",
-        params![nick, now(), err],
-    )?;
+    db.execute("UPDATE peers SET last_attempt = ?2, last_err = ?3 WHERE nick = ?1", params![nick, now(), err])?;
     Ok(())
 }
 
 pub fn peer_seen(db: &Connection, nick: &str) -> Result<()> {
-    db.execute(
-        "UPDATE peers SET last_seen = ?2, last_err = NULL WHERE nick = ?1",
-        params![nick, now()],
-    )?;
+    db.execute("UPDATE peers SET last_seen = ?2, last_err = NULL WHERE nick = ?1", params![nick, now()])?;
     Ok(())
 }
 
@@ -188,27 +165,19 @@ pub fn mark_delivered(db: &Connection, peer: &str, id: i64) -> Result<bool> {
 }
 
 pub fn requeue(db: &Connection, peer: &str) -> Result<()> {
-    db.execute(
-        "UPDATE messages SET status = 'pending' WHERE dir = 'out' AND peer = ?1 AND status = 'sent'",
-        [peer],
-    )?;
+    db.execute("UPDATE messages SET status = 'pending' WHERE dir = 'out' AND peer = ?1 AND status = 'sent'", [peer])?;
     Ok(())
 }
 
 pub fn stale_sent(db: &Connection, ack_timeout_secs: i64) -> Result<Vec<String>> {
-    let mut stmt = db.prepare(
-        "SELECT DISTINCT peer FROM messages WHERE dir = 'out' AND status = 'sent' AND updated < ?1",
-    )?;
+    let mut stmt = db.prepare("SELECT DISTINCT peer FROM messages WHERE dir = 'out' AND status = 'sent' AND updated < ?1")?;
     let rows = stmt.query_map([now() - ack_timeout_secs], |r| r.get(0))?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-/// Only known peers: replies to never-added senders stay pending until `/add`.
+/// Contacts and strangers (labelled by their address) alike.
 pub fn peers_with_pending(db: &Connection) -> Result<Vec<String>> {
-    let mut stmt = db.prepare(
-        "SELECT DISTINCT m.peer FROM messages m JOIN peers p ON p.nick = m.peer
-         WHERE m.dir = 'out' AND m.status = 'pending'",
-    )?;
+    let mut stmt = db.prepare("SELECT DISTINCT peer FROM messages WHERE dir = 'out' AND status = 'pending'")?;
     let rows = stmt.query_map([], |r| r.get(0))?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
@@ -260,6 +229,23 @@ pub fn mark_read(db: &Connection, peer: &str, address: Option<&str>) -> Result<(
     Ok(())
 }
 
+pub fn unread(db: &Connection, peer: &str) -> Result<i64> {
+    Ok(db.query_row("SELECT COUNT(*) FROM messages WHERE peer = ?1 AND dir = 'in' AND read = 0", [peer], |r| r.get(0))?)
+}
+
+/// Deletes one conversation (`peer`, plus messages stored under its address) or, with `None`, all of them.
+/// The checkpoint rewrites the database and empties the WAL, which still holds copies of the text.
+pub fn purge(db: &Connection, peer: Option<(&str, Option<&str>)>) -> Result<usize> {
+    let deleted = match peer {
+        Some((peer, address)) => {
+            db.execute("DELETE FROM messages WHERE peer = ?1 OR lower(peer) = lower(?2)", params![peer, address.unwrap_or("")])?
+        }
+        None => db.execute("DELETE FROM messages", [])?,
+    };
+    db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+    Ok(deleted)
+}
+
 pub fn conversations(db: &Connection) -> Result<Vec<Conversation>> {
     let mut stmt = db.prepare(
         "SELECT m.peer, m.text, m.created,
@@ -269,9 +255,7 @@ pub fn conversations(db: &Connection) -> Result<Vec<Conversation>> {
                           ORDER BY x.created DESC, x.rowid DESC LIMIT 1)
          ORDER BY m.created DESC, m.rowid DESC",
     )?;
-    let rows = stmt.query_map([], |r| {
-        Ok(Conversation { peer: r.get(0)?, last_text: r.get(1)?, last_at: r.get(2)?, unread: r.get(3)? })
-    })?;
+    let rows = stmt.query_map([], |r| Ok(Conversation { peer: r.get(0)?, last_text: r.get(1)?, last_at: r.get(2)?, unread: r.get(3)? }))?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
@@ -303,6 +287,39 @@ mod tests {
 
     fn status(db: &Connection, id: i64) -> String {
         db.query_row("SELECT status FROM messages WHERE id = ?1", [id], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn purge_removes_text_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.db");
+        let db = open(&path).unwrap();
+        add_peer(&db, "b", "0xB").unwrap();
+        insert_out(&db, "b", 1, "SECRET-to-b", "pending").unwrap();
+        insert_in(&db, &incoming("0xb", 2, "SECRET-from-b")).unwrap();
+        insert_out(&db, "c", 3, "keep-for-c", "pending").unwrap();
+
+        assert_eq!(purge(&db, Some(("b", Some("0xB")))).unwrap(), 2);
+        assert_eq!(history(&db, "c", None, 10).unwrap().len(), 1);
+        let on_disk = |name: &str| {
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes.extend(std::fs::read(path.with_extension("db-wal")).unwrap_or_default());
+            bytes.windows(name.len()).any(|w| w == name.as_bytes())
+        };
+        assert!(!on_disk("SECRET"));
+        assert!(on_disk("keep-for-c"));
+
+        assert_eq!(purge(&db, None).unwrap(), 1);
+        assert!(!on_disk("keep-for-c"));
+    }
+
+    #[test]
+    fn remove_peer_keeps_others() {
+        let db = mem();
+        add_peer(&db, "c", "0xC").unwrap();
+        assert!(remove_peer(&db, "b").unwrap());
+        assert!(!remove_peer(&db, "b").unwrap());
+        assert_eq!(peers(&db).unwrap().iter().map(|p| p.nick.as_str()).collect::<Vec<_>>(), ["c"]);
     }
 
     #[test]
@@ -351,6 +368,7 @@ mod tests {
         insert_in(&db, &incoming("b", 1, "one")).unwrap();
         insert_in(&db, &incoming("b", 2, "two")).unwrap();
         insert_out(&db, "c", 3, "to c", "pending").unwrap();
+        assert_eq!(unread(&db, "b").unwrap(), 2);
         let convs = conversations(&db).unwrap();
         assert_eq!(convs.len(), 2);
         let b = convs.iter().find(|c| c.peer == "b").unwrap();
@@ -360,10 +378,10 @@ mod tests {
     }
 
     #[test]
-    fn replies_to_unknown_senders_are_not_dialed() {
+    fn replies_to_strangers_are_redialed_too() {
         let db = mem();
         insert_out(&db, "0xstranger", 1, "hi", "pending").unwrap();
-        assert!(peers_with_pending(&db).unwrap().is_empty());
+        assert_eq!(peers_with_pending(&db).unwrap(), vec!["0xstranger"]);
         assert_eq!(outbox(&db).unwrap().len(), 1);
     }
 

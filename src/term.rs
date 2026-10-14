@@ -1,8 +1,9 @@
-//! Terminal helpers shared by the TUI and the CLI: plain-stdout onboarding before either takes over.
+//! Plain-stdout onboarding and colours, used before the TUI takes over the screen.
 
 use anyhow::{bail, Result};
 use hopr_chat::{
     app::{SafeChoice, Status},
+    chat::is_address,
     db,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -41,7 +42,10 @@ pub async fn choose_safe(node_address: &str) -> Result<SafeChoice> {
             "1" => {
                 let safe = ask("Safe address:").await?;
                 let module = ask("Module address:").await?;
-                return Ok(SafeChoice::Existing { safe, module });
+                if is_address(&safe) && is_address(&module) {
+                    return Ok(SafeChoice::Existing { safe, module });
+                }
+                println!("both must be 0x + 40 hex characters");
             }
             "2" => return Ok(SafeChoice::Create),
             _ => println!("type 1 or 2"),

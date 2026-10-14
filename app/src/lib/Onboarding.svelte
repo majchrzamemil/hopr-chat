@@ -71,7 +71,7 @@
 
     {#if snapshot.fatal}
       <pre class="fatal">{snapshot.fatal}</pre>
-      <p class="muted">Check <span class="mono">hoprd.log</span> in the app data folder, fix the cause and restart the app.</p>
+      <p class="muted">Check <span class="mono">hoprd.log</span> in the app data folder (logcat on Android), fix the cause and restart the app.</p>
     {:else if snapshot.choose_safe}
       <p>This node has no Safe yet. The Safe holds the wxHOPR that pays relays; the node only needs a little xDai for gas.</p>
       {#if mode === "existing"}

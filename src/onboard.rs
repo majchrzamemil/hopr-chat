@@ -1,5 +1,5 @@
-//! First-start onboarding for production mode, modelled on GnosisVPN:
-//! identity file, then a Safe (existing or deployed by us), then the hoprd config.
+//! First-start onboarding for production mode: identity file, then a Safe (existing or deployed by
+//! us), then the hoprd config.
 
 use std::{io::Write, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
 
@@ -15,6 +15,7 @@ use serde_json::json;
 
 use crate::{
     app::{SafeChoice, Status, Ui},
+    chat::is_address,
     settings::Settings,
 };
 
@@ -61,7 +62,8 @@ pub fn identity(home: &Path) -> Result<(HoprKeys, String, bool)> {
 pub async fn safe<U: Ui>(ui: &mut U, keys: &HoprKeys, blokli_url: &str, home: &Path) -> Result<Safe> {
     let file = home.join(SAFE_FILE);
     if let Ok(text) = std::fs::read_to_string(&file) {
-        return Ok(serde_yaml::from_str(&text)?);
+        return serde_yaml::from_str(&text)
+            .with_context(|| format!("{} is unreadable: delete it to choose the Safe again", file.display()));
     }
 
     let endpoint = BlokliEndpoint::new(blokli_url.parse().context("blokli url")?);
@@ -69,7 +71,10 @@ pub async fn safe<U: Ui>(ui: &mut U, keys: &HoprKeys, blokli_url: &str, home: &P
     let safe = match ops.retrieve_safe().await? {
         Some(found) => Safe { safe_address: found.safe_address.to_string(), module_address: found.module_address.to_string() },
         None => match ui.choose_safe(&address_of(keys)).await? {
-            SafeChoice::Existing { safe, module } => Safe { safe_address: safe, module_address: module },
+            SafeChoice::Existing { safe, module } => {
+                anyhow::ensure!(is_address(&safe) && is_address(&module), "Safe and module must be 0x + 40 hex characters");
+                Safe { safe_address: safe, module_address: module }
+            }
             SafeChoice::Create => deploy(ui, &*ops, &address_of(keys)).await?,
         },
     };
@@ -127,16 +132,15 @@ mod tests {
 
     #[test]
     fn hoprd_config_allows_only_our_target() {
-        let home = std::env::temp_dir().join(format!("hopr-chat-onboard-{}", std::process::id()));
-        std::fs::create_dir_all(&home).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
         let safe = Safe { safe_address: "0xsafe".into(), module_address: "0xmodule".into() };
-        write_hoprd_config(&home, &Settings::new("a".into()), "pw", &safe, "127.0.0.1:25000").unwrap();
+        write_hoprd_config(home, &Settings::new("a".into()), "pw", &safe, "127.0.0.1:25000").unwrap();
         let yaml: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(home.join(HOPRD_CONFIG)).unwrap()).unwrap();
         assert_eq!(yaml["session_ip_forwarding"]["target_allow_list"][0], "127.0.0.1:25000");
         assert_eq!(yaml["session_ip_forwarding"]["use_target_allow_list"], true);
         assert_eq!(yaml["hopr"]["safe_module"]["module_address"], "0xmodule");
         assert_eq!(yaml["identity"]["password"], "pw");
-        std::fs::remove_dir_all(home).unwrap();
     }
 }
 

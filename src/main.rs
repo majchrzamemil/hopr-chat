@@ -1,5 +1,3 @@
-#[cfg(feature = "cli")]
-mod cli;
 mod term;
 mod tui;
 
@@ -18,10 +16,6 @@ struct Cli {
     prod: ProdArgs,
     #[command(flatten)]
     opts: OptsArgs,
-    /// Line-mode frontend instead of the TUI
-    #[cfg(feature = "cli")]
-    #[arg(long, global = true)]
-    cli: bool,
 }
 
 /// Default mode: own node, onboarding on first start, bundled hoprd.
@@ -46,9 +40,9 @@ struct ProdArgs {
 
 #[derive(Args)]
 struct OptsArgs {
-    #[arg(long, global = true, default_value_t = 15)]
+    #[arg(long, global = true, default_value_t = app::DEFAULT_OPTS.retry_secs)]
     retry_secs: u64,
-    #[arg(long, global = true, default_value_t = 30)]
+    #[arg(long, global = true, default_value_t = app::DEFAULT_OPTS.ack_timeout)]
     ack_timeout: i64,
 }
 
@@ -96,10 +90,10 @@ struct ChatArgs {
 
 impl ChatArgs {
     fn data_dir(&self) -> Result<PathBuf> {
-        Ok(match &self.data {
-            Some(d) => d.clone(),
-            None => PathBuf::from(std::env::var("HOME")?).join(".hopr-chat").join(&self.nick),
-        })
+        match &self.data {
+            Some(d) => Ok(d.clone()),
+            None => settings::nick_dir(&self.nick),
+        }
     }
 }
 
@@ -109,11 +103,7 @@ struct ClusterArgs {
     localcluster_bin: String,
     #[arg(long, env = "HOPR_CHAT_HOPRD_BIN", default_value = "hoprd")]
     hoprd_bin: String,
-    #[arg(
-        long,
-        env = "HOPR_CHAT_CHAIN_IMAGE",
-        default_value = "europe-west3-docker.pkg.dev/hoprassociation/docker-images/bloklid-anvil@sha256:75956aede10a71fbb8a46fae05d1aa1caed10ae6ed410c4385df3d565b4fe4fc"
-    )]
+    #[arg(long, env = "HOPR_CHAT_CHAIN_IMAGE", default_value = hoprd::CHAIN_IMAGE)]
     chain_image: String,
     #[arg(long, default_value = "/tmp/hopr-nodes")]
     cluster_dir: PathBuf,
@@ -122,14 +112,7 @@ struct ClusterArgs {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    #[cfg(feature = "cli")]
-    if cli.cli {
-        return dispatch(&mut cli::CliUi::default(), cli).await;
-    }
-    dispatch(&mut tui::TuiUi::default(), cli).await
-}
-
-async fn dispatch<U: app::Ui>(ui: &mut U, cli: Cli) -> Result<()> {
+    let ui = &mut tui::TuiUi::default();
     let opts = app::ChatOpts { retry_secs: cli.opts.retry_secs, ack_timeout: cli.opts.ack_timeout };
     match cli.cmd {
         None => {
@@ -159,8 +142,7 @@ async fn dispatch<U: app::Ui>(ui: &mut U, cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Cmd::Attach { chat, api, token, hoprd_config }) => {
-            let attach =
-                app::Attach { data_dir: chat.data_dir()?, nick: chat.nick, hops: chat.hops, api, token, hoprd_config };
+            let attach = app::Attach { data_dir: chat.data_dir()?, nick: chat.nick, hops: chat.hops, api, token, hoprd_config };
             app::attach(ui, attach, opts).await
         }
     }

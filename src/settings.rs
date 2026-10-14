@@ -4,15 +4,12 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// `(name, blokli url)`; the first is the default. hopr-lib 5 only talks to v5 networks.
-pub const NETWORKS: [(&str, &str); 3] = [
-    ("piz-palu", "https://blokli-piz-palu.dev.hoprnet.link"),
-    ("jura", "https://blokli.jura.gnosisvpn.io"),
-    ("rotsee", "https://blokli.rotsee.hoprnet.link"),
-];
+pub const NETWORKS: [(&str, &str); 1] = [("piz-palu", "https://blokli-piz-palu.dev.hoprnet.link")];
 
 pub fn blokli_url(network: &str) -> Option<String> {
     NETWORKS.iter().find(|(name, _)| *name == network).map(|(_, url)| url.to_string())
 }
+
 const VERSION: u32 = 1;
 
 /// App settings persisted as `settings.toml` in the app home.
@@ -30,15 +27,7 @@ pub struct Settings {
 
 impl Settings {
     pub fn new(nick: String) -> Self {
-        Self {
-            version: VERSION,
-            nick,
-            blokli_url: NETWORKS[0].1.into(),
-            hops: 1,
-            api_port: 3100,
-            p2p_port: 9100,
-            hoprd_bin: None,
-        }
+        Self { version: VERSION, nick, blokli_url: NETWORKS[0].1.into(), hops: 1, api_port: 3100, p2p_port: 9100, hoprd_bin: None }
     }
 }
 
@@ -53,6 +42,11 @@ pub fn home() -> Result<PathBuf> {
     } else {
         std::env::var("XDG_DATA_HOME").map_or(home.join(".local/share"), PathBuf::from).join("hopr-chat")
     })
+}
+
+/// Data dir of a dev/attach chat: `~/.hopr-chat/<nick>`.
+pub fn nick_dir(nick: &str) -> Result<PathBuf> {
+    Ok(PathBuf::from(std::env::var("HOME").context("HOME not set")?).join(".hopr-chat").join(nick))
 }
 
 pub fn load(path: &Path) -> Result<Option<Settings>> {
@@ -75,13 +69,11 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let dir = std::env::temp_dir().join(format!("hopr-chat-settings-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("settings.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
         assert!(load(&path).unwrap().is_none());
         let s = Settings::new("alice".into());
         save(&path, &s).unwrap();
         assert_eq!(load(&path).unwrap(), Some(s));
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

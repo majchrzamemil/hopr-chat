@@ -10,7 +10,10 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 
-/** Does no work itself: being a foreground service keeps the process, and the hoprd node inside it, alive in the background. */
+/**
+ * Does no work itself: being a foreground service keeps the process, and the hoprd node inside it, alive in the
+ * background. Not sticky and stopped with the task: the node only exists while the app's activity started it.
+ */
 class NodeService : Service() {
   override fun onBind(intent: Intent?): IBinder? = null
 
@@ -30,7 +33,7 @@ class NodeService : Service() {
     } else {
       startForeground(1, notification)
     }
-    return START_STICKY
+    return START_NOT_STICKY
   }
 
   companion object {

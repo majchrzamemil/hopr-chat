@@ -9,6 +9,9 @@ use anyhow::{bail, Context, Result};
 use reqwest::{Method, RequestBuilder};
 use serde_json::{json, Value};
 
+/// anvil + blokli image for localcluster; the digest is the hoprd CI pin.
+pub const CHAIN_IMAGE: &str = "europe-west3-docker.pkg.dev/hoprassociation/docker-images/bloklid-anvil@sha256:75956aede10a71fbb8a46fae05d1aa1caed10ae6ed410c4385df3d565b4fe4fc";
+
 pub struct Api {
     http: reqwest::Client,
     base: String,
@@ -107,12 +110,7 @@ fn cluster_status(localcluster_bin: &str, cluster_dir: &Path) -> Result<Value> {
 fn check_container_runtime() -> Result<()> {
     let runtime = std::env::var("HOPRD_CONTAINER_RUNTIME").unwrap_or_else(|_| "docker".into());
     let args: &[&str] = if runtime.ends_with("container") { &["system", "status"] } else { &["info"] };
-    let ok = Command::new(&runtime)
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
+    let ok = Command::new(&runtime).args(args).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
     if !ok {
         bail!(
             "container runtime `{runtime}` is not usable (localcluster needs it for anvil + blokli). \
@@ -124,16 +122,13 @@ fn check_container_runtime() -> Result<()> {
 }
 
 fn lock_held(lock: &Path) -> bool {
-    std::fs::read_to_string(lock).is_ok_and(|pid| {
-        Command::new("kill")
-            .args(["-0", pid.trim()])
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-    })
+    std::fs::read_to_string(lock)
+        .is_ok_and(|pid| Command::new("kill").args(["-0", pid.trim()]).stderr(Stdio::null()).status().is_ok_and(|s| s.success()))
 }
 
-/// Starts localcluster if needed and claims a node. Returns the node API, its id and our lock file.
+/// Starts localcluster if needed and claims a node: `node` if given, else `remembered` while it is free
+/// (frozen identities make a node id a stable address), else the first free one.
+/// Returns the node API, its id and our lock file.
 pub async fn dev_attach(
     localcluster_bin: &str,
     hoprd_bin: &str,
@@ -141,6 +136,7 @@ pub async fn dev_attach(
     cluster_dir: &Path,
     log: &Path,
     node: Option<u64>,
+    remembered: Option<u64>,
 ) -> Result<(Api, u64, PathBuf)> {
     let mut status = cluster_status(localcluster_bin, cluster_dir)?;
     let mut spawned = None;
@@ -176,22 +172,24 @@ pub async fn dev_attach(
         status = cluster_status(localcluster_bin, cluster_dir)?;
     }
 
-    for n in status["nodes"].as_array().context("no nodes in localcluster status")? {
-        let id = n["id"].as_u64().context("node without id")?;
-        let lock = cluster_dir.join(format!("chat-node-{id}.lock"));
-        let wanted = match node {
-            Some(want) => want == id,
-            None => !lock_held(&lock),
-        };
-        if !wanted {
-            continue;
-        }
-        std::fs::write(&lock, std::process::id().to_string())?;
-        let api_url = n["api_url"].as_str().context("node without api_url")?;
-        let api = Api::new(api_url, n["api_token"].as_str().map(str::to_string));
-        return Ok((api, id, lock));
-    }
-    bail!("no free localcluster node, pick one with --node")
+    let nodes = status["nodes"].as_array().context("no nodes in localcluster status")?;
+    let lock_of = |id: u64| cluster_dir.join(format!("chat-node-{id}.lock"));
+    let free = |n: &&Value| n["id"].as_u64().is_some_and(|id| !lock_held(&lock_of(id)));
+    let with_id = |want: u64| move |n: &&Value| n["id"].as_u64() == Some(want);
+    let picked = match node {
+        Some(want) => nodes.iter().find(with_id(want)).with_context(|| format!("no localcluster node {want}"))?,
+        None => remembered
+            .and_then(|want| nodes.iter().filter(free).find(with_id(want)))
+            .or_else(|| nodes.iter().find(free))
+            .context("no free localcluster node, pick one with --node")?,
+    };
+    let id = picked["id"].as_u64().context("node without id")?;
+    anyhow::ensure!(node.is_none() || free(&picked), "localcluster node {id} is used by another chat");
+    let lock = lock_of(id);
+    std::fs::write(&lock, std::process::id().to_string())?;
+    let api_url = picked["api_url"].as_str().context("node without api_url")?;
+    let api = Api::new(api_url, picked["api_token"].as_str().map(str::to_string));
+    Ok((api, id, lock))
 }
 
 pub fn dev_down(localcluster_bin: &str, cluster_dir: &Path) -> Result<String> {
@@ -221,9 +219,9 @@ fn tail(log: &Path) -> String {
     lines[lines.len().saturating_sub(10)..].join("\n")
 }
 
-/// Spawns hoprd as a child that dies with us and waits until it is ready, failing early if it exits.
-/// First start can take long: hoprd registers the Safe and announces the node on chain.
-pub async fn launch(hoprd_bin: &Path, config: &Path, api_port: u16, log_path: &Path) -> Result<(Api, tokio::process::Child)> {
+/// Spawns hoprd and waits until it is ready, failing early if it exits. First start can take long:
+/// hoprd registers the Safe and announces the node on chain. The returned `stop` blocks until it exited.
+pub async fn launch(hoprd_bin: &Path, config: &Path, api_port: u16, log_path: &Path) -> Result<(Api, impl FnOnce() + Send + 'static)> {
     let token = random_hex(16)?;
     let log = std::fs::File::create(log_path)?;
     let child = tokio::process::Command::new(hoprd_bin)
@@ -246,7 +244,16 @@ pub async fn launch(hoprd_bin: &Path, config: &Path, api_port: u16, log_path: &P
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    Ok((api, child))
+    let stop = move || {
+        if let Some(pid) = child.id() {
+            let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).status();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.try_wait().is_ok_and(|exit| exit.is_none()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+    Ok((api, stop))
 }
 
 pub fn random_hex(bytes: usize) -> Result<String> {
@@ -256,18 +263,27 @@ pub fn random_hex(bytes: usize) -> Result<String> {
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Runs hoprd inside this process (mobile has no sidecars), on its own runtime: hoprd wants
-/// bigger thread stacks than the host app's. Dropping the returned sender stops the node.
+/// Runs hoprd inside this process (mobile has no sidecars), on its own runtime: hoprd wants bigger
+/// thread stacks than the host app's. The returned `stop` blocks until the node is torn down.
 #[cfg(feature = "embedded")]
 pub async fn embed(
     keys: edgli::hopr_lib::HoprKeys,
     config: &Path,
     api_port: u16,
     log_path: &Path,
-) -> Result<(Api, tokio::sync::oneshot::Sender<()>)> {
+) -> Result<(Api, impl FnOnce() + Send + 'static)> {
     use clap::Parser;
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
 
     let token = random_hex(16)?;
+    // So you can query your own node: curl -H "X-Auth-Token: $(cat hoprd.token)" localhost:<api_port>/api/v4/...
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(log_path.with_file_name("hoprd.token"))?
+        .write_all(token.as_bytes())?;
     let log = std::fs::File::create(log_path)?;
     let _ = tracing_subscriber::fmt()
         .with_writer(std::sync::Mutex::new(log))
@@ -278,20 +294,32 @@ pub async fn embed(
     let config = config.to_str().context("config path")?;
     let port = api_port.to_string();
     let args = hoprd::cli::CliArgs::try_parse_from([
-        "hoprd", "--configurationFilePath", config, "--api", "--apiHost", "127.0.0.1", "--apiPort", &port, "--apiToken", &token,
+        "hoprd",
+        "--configurationFilePath",
+        config,
+        "--api",
+        "--apiHost",
+        "127.0.0.1",
+        "--apiPort",
+        &port,
+        "--apiToken",
+        &token,
     ])?;
     let cfg = hoprd::config::HoprdConfig::try_from(args)?;
 
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let (done, mut exited) = tokio::sync::oneshot::channel::<String>();
-    std::thread::Builder::new().name("hoprd".into()).spawn(move || {
+    // Dropping `main_inner` drops the node and its processes, which is also how hoprd tears down on SIGTERM.
+    let node = std::thread::Builder::new().name("hoprd".into()).spawn(move || {
         let result = edgli::hopr_lib::prepare_tokio_runtime(None, None, None).and_then(|rt| {
-            rt.block_on(async {
+            let result = rt.block_on(async {
                 tokio::select! {
                     r = hoprd::main_inner(cfg, keys) => r,
                     _ = stopped => Ok(()),
                 }
-            })
+            });
+            rt.shutdown_timeout(Duration::from_secs(5));
+            result
         });
         let _ = done.send(result.map_or_else(|e| format!("{e:#}"), |_| "stopped".into()));
     })?;
@@ -303,5 +331,8 @@ pub async fn embed(
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    Ok((api, stop))
+    Ok((api, move || {
+        drop(stop);
+        let _ = node.join();
+    }))
 }

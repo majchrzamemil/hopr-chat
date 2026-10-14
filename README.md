@@ -1,13 +1,124 @@
 # hopr-chat
 
-Anonymous P2P chat over HOPR sessions. The app runs its own hoprd node (inside the same process), signs
-every message with the node's chain key, and keeps conversations in SQLite. Frontends: TUI (default),
-line-mode CLI, desktop GUI (Tauri) and Android (same Tauri app).
+Anonymous P2P chat over HOPR sessions. The app runs its own hoprd node inside the same process, signs
+every message with the node's chain key, and keeps conversations in SQLite. Frontends: a terminal UI
+(TUI) and a GUI (Tauri) for desktop and Android.
+
+How the pieces fit together (UI ↔ core ↔ embedded hoprd ↔ HOPR network, wire protocol, storage,
+Android specifics) is in [ARCHITECTURE.md](ARCHITECTURE.md).
+
+## Quick start
+
+    cargo run --release                      # TUI; first start walks through onboarding
+    cd app && npm install && npm run tauri dev   # GUI (dev build)
+    cd app && npm run bundle                 # GUI release bundle (.app/.dmg on macOS)
+
+TUI and GUI on the same machine are the same node with the same chats. **Only one runs at a time**: the
+second refuses to start (`port 3100 is busy: is hopr-chat (TUI or desktop app) already running?`).
+
+## First start (own node)
+
+    hopr-chat --nick alice        # later just `hopr-chat`
+
+1. Creates the node identity (`hopr.id` + generated `hopr.pass`) in the app home.
+2. Finds the node's Safe:
+   - If a Safe owned by this node already exists on chain, it uses that.
+   - Otherwise it asks:
+     - **existing**: enter the Safe and module addresses. The node must already be added to that
+       module, e.g. via the HOPR staking hub.
+     - **create**: fund the shown node address with xDai + wxHOPR. The app waits, then deploys the
+       Safe and moves the wxHOPR into it.
+3. Writes `hoprd.yaml` and starts hoprd in-process. On first start hoprd registers the node with the
+   Safe (0.01 wxHOPR from the Safe, gas from the node) and announces it on chain.
+   - The session allow list contains only this chat's target (`127.0.0.1:<port derived from the address>`).
+   - The REST API listens on 127.0.0.1 with a random token.
+   - hoprd's default strategies auto-open channels.
+
+Network is piz-palu (HOPR v5, Gnosis Chain). Settings (`nick`, `blokli_url`, `hops`, ports) live in
+`settings.toml`; `--nick`, `--network`, `--blokli-url` and `--hops` update them.
+
+The p2p port (default 9100, UDP) does not need to be reachable from the internet: a node behind NAT
+announces no address and is reached through relays over connections it opened itself.
+
+## Using the TUI
+
+`?` help, `/` command palette (Tab/Enter completes, ↑↓ picks), ↑↓ switch chat, PgUp/PgDn scroll,
+Ctrl-W/Ctrl-U edit, Esc closes popups, Ctrl-C quits.
+
+    /add bob 0x...     save a contact (hoprd checks it is an announced node)
+    /peers             contacts and their reachability
+    /balance           node and Safe balances
+    /whoami            the /add line to give to others
+    /clear [all]       wipe the open chat (or every chat) from disk
+    /remove [nick]     delete a contact and its messages (default: open chat)
+
+Outgoing messages show `…` queued, `✓` sent, `✓✓` delivered. Incoming ones show `✓` (signed by the
+sender's node) or `?` (unsigned).
+
+- **Delivery:** messages are queued in SQLite and count as delivered only on the peer's ack. Peers with
+  queued messages are redialed every 15 s, and unacked messages are resent after a restart.
+- **Signatures:** a message from a contact must carry a valid signature from the contact's node,
+  otherwise it is dropped. Unsigned messages are accepted only from strangers (not in your contacts),
+  and show up under the sender's address. Replies to a stranger go back over its open connection, or,
+  once that is gone, to its node address like to a contact. `/remove` on a stranger's chat deletes it.
+
+## GUI
+
+Same core as the TUI (`app/src-tauri` implements the `Ui` trait, `app/src` is the Svelte 5 UI).
+
+- Onboarding screens: identity, Safe choice (existing or create), funding with a live balance, node startup.
+- Chat list with unread counts and search (⌘K). New chat (⌘N) checks that the address is an announced node.
+- Message bubbles with the contact's name, signature badge and delivery state (🕓 queued, ✓ sent, ✓✓ delivered).
+- Balance chip with gas/funds warnings, a share-address dialog, toasts.
+- **Clear** (chat header) wipes a conversation, **Delete contact** removes the contact with its
+  messages, **Delete all messages** (sidebar) wipes every conversation.
+- Closing the window shuts down cleanly: sessions are closed and the node is stopped.
+- Narrow screens (phones) show either the chat list or one conversation; back returns to the list.
+
+Other modes, picked by environment variables:
+
+    HOPR_CHAT_DEV_NICK=a npm run tauri dev               # localcluster node, like `hopr-chat dev`
+    HOPR_CHAT_DEV_NICK=b npm run tauri:second            # 2nd window: reuses the dev server on :1420
+    HOPR_CHAT_ATTACH_API=http://localhost:3002 HOPR_CHAT_NICK=me \
+      HOPR_CHAT_HOPRD_CONFIG=/tmp/hopr-nodes/hoprd_cfg_2.yaml npm run tauri dev   # running hoprd
+
+Also: `HOPR_CHAT_HOPS`, `HOPR_CHAT_NETWORK`, `HOPR_CHAT_HOME`, `HOPR_CHAT_DEV_NODE`,
+`HOPR_CHAT_CLUSTER_DIR`. Dev modes keep data in `~/.hopr-chat/<nick>/`.
+
+## Android
+
+Same Tauri app; hoprd runs inside the app process and a foreground service keeps it alive in the
+background. Swiping the app away from recents ends that service, after which Android may stop the
+process (and the node) at any time.
+
+Prerequisites: Android SDK (`ANDROID_HOME`), NDK r28+ (`NDK_HOME`, 16 KB pages), JDK 17,
+`rustup target add aarch64-linux-android`. With Homebrew, for example:
+
+    export ANDROID_HOME=/opt/homebrew/share/android-commandlinetools
+    export NDK_HOME=$ANDROID_HOME/ndk/<version> JAVA_HOME=/opt/homebrew/opt/openjdk@17
+
+**Signing = keeping your identity.** `adb install -r` upgrades in place and keeps the app data only
+when the APK is signed with the same key; otherwise the only way out is uninstalling, which deletes the
+identity. Create a release key once and back it up together with its passwords:
+
+    keytool -genkeypair -v -keystore ~/.android/hopr-chat-release.jks -alias hopr-chat \
+      -keyalg RSA -keysize 4096 -validity 10000
+
+and point Gradle at it in `app/src-tauri/gen/android/key.properties` (gitignored):
+
+    storeFile=/Users/<you>/.android/hopr-chat-release.jks
+    storePassword=...
+    keyAlias=hopr-chat
+    keyPassword=...
+
+Without `key.properties` the release APK is unsigned. Build and install (phone with USB debugging on):
+
+    cd app
+    npx tauri android build --apk -t aarch64             # ~10 min
+    adb install -r src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk
+    adb logcat | grep RustStdoutStderr                   # core + hoprd logs
 
 ## Where things live
-
-Every frontend in production mode uses one **app home**. TUI and desktop GUI on the same machine share it,
-so they are the same node with the same chats.
 
 | Platform | App home |
 |---|---|
@@ -20,37 +131,30 @@ so they are the same node with the same chats.
 |---|---|---|
 | `hopr.id` | node identity: chain key (node address, signs messages) + packet key, encrypted keystore | the node is gone; a new identity is a new node |
 | `hopr.pass` | random password for `hopr.id` (0600). Anyone with both files has the node key | `hopr.id` can't be opened |
-| `hopr.safe` | Safe + module address (YAML) | re-enter them ("Use an existing Safe") |
+| `hopr.safe` | Safe + module address (YAML). Delete it to choose the Safe again | re-enter them ("Use an existing Safe") |
 | `settings.toml` | nick, network (`blokli_url`), hops, API/p2p ports | defaults come back |
-| `chat.db` | peers, messages, delivery state (SQLite) | chat history |
+| `chat.db` | contacts, messages, delivery state (SQLite) | chat history |
 | `hoprd.yaml` | hoprd config, rewritten on every start | nothing |
 | `hoprd-db/` | hoprd's own database | resynced from chain |
-| `hoprd.log` | hoprd + core log (desktop/TUI; Android logs to logcat) | nothing |
-| `prompt-history.txt` | CLI line history | nothing |
+| `hoprd.log` | hoprd + core log (desktop; Android logs to logcat) | nothing |
+| `hoprd.token` | REST API token of the running node (0600), for `curl` | nothing (new each start) |
 
-**Back up `hopr.id` + `hopr.pass` together** (or the whole home). On desktop they survive app updates and
-rebuilds. On Android they survive updates only if the new APK is signed with the same key (see Android
-below); uninstall or "Clear storage" deletes them. If the app created the Safe itself ("Create a new
-Safe"), the node key is the Safe owner, so losing it also loses the Safe's funds. A Safe owned by a
-separate (Ledger) address avoids that.
+**Back up `hopr.id` + `hopr.pass` together** (or the whole home). On Android they survive updates only
+if the new APK is signed with the same key; uninstall or "Clear storage" deletes them. If the app
+created the Safe itself, the node key is the Safe owner, so losing it also loses the Safe's funds. A
+Safe owned by a separate (Ledger) address avoids that.
 
-Other locations: dev mode (localcluster) uses `~/.hopr-chat/<nick>/` (TUI) and the cluster's own
-`/tmp/hopr-nodes/`; the Android signing key is `~/.android/hopr-chat-release.jks`.
+## Deleting messages
 
-## Desktop: TUI or GUI
-
-Both run the same node from the same app home. **Only one at a time**: the second one refuses to start
-(`port 3100 is busy: is hopr-chat (TUI or desktop app) already running?`). Quit one, start the other;
-identity, Safe and chats carry over.
-
-    cargo run --release                 # TUI (repo root); add --cli with --features cli
-    cd app && npm run tauri dev         # GUI (dev build)
-    cd app && npm run bundle            # GUI release bundle (.app/.dmg); then open it like any app
+The text is really gone from `chat.db`: SQLite runs with `secure_delete` (freed pages are overwritten)
+and the purge checkpoints and truncates the WAL, which would otherwise keep copies. Queued messages that
+were not sent yet are dropped too. It only affects this device: your peer keeps their copy, and backups
+made before (Time Machine, Android backup) still have it.
 
 ## One Safe for several nodes (phone + desktop)
 
 The in-app "Create a new Safe" makes one Safe per node, owned by that node's key. To share one Safe
-between your nodes, create it with hopli (`hoprnet/hopli`, supports `piz-palu-dev`):
+between your nodes, create it with hopli (`hoprnet/hopli`):
 
     PRIVATE_KEY=<gas-only deployer key> hopli safe-module create \
       --network piz-palu-dev --provider-url https://rpc.gnosischain.com \
@@ -61,169 +165,76 @@ between your nodes, create it with hopli (`hoprnet/hopli`, supports `piz-palu-de
   dedicated (ideally Ledger) account. Omit it and the deployer key becomes the owner.
 - Node addresses: the app shows them on the Safe screen, or
   `hopli identity read --identity-from-path <home>/hopr.id --password-path <home>/hopr.pass`.
-- Then fund on Gnosis Chain: wxHOPR (`0xD4fd…A2c1`) to the Safe, ~0.05 xDai gas to each node.
-- In each app choose "Use an existing Safe" and enter the Safe + module addresses (saved as `hopr.safe`).
+- Fund on Gnosis Chain: wxHOPR (`0xD4fdec44DB9D44B8f2b6d529620f9C0C7066A2c1`) to the Safe, ~0.05 xDai
+  gas to each node.
+- In each app choose "Use an existing Safe" and enter the Safe + module addresses.
 
-## Layout
+## Verify traffic really goes over HOPR
 
-    src/lib.rs        library: everything below is UI-free
-      app.rs          `Ui` trait + production / dev / attach flows
-      onboard.rs      first start: identity, Safe (existing or deployed), hoprd.yaml
-      chat.rs         core: sessions, acks, retries, signing, wallet; emits `Event`s
-      db.rs           SQLite: peers, messages (nick, verified, unread), conversations
-      hoprd.rs        hoprd REST client, in-process `embed()` or child-process `launch()`, localcluster
-      settings.rs     versioned settings.toml
-    src/tui.rs        `TuiUi: Ui` (ratatui) — default frontend
-    src/cli.rs        `CliUi: Ui` (rustyline) — only with `--features cli`, picked with `--cli`
-    src/term.rs       onboarding prompts/status shared by both     src/main.rs  clap
-    app/              Tauri desktop GUI (src-tauri: `TauriUi: Ui` + commands, src: Svelte UI)
+**1. On chain (no node access needed).** Your Safe's payment channels to relays, from blokli:
 
-A GUI implements the same `Ui` trait (`choose_safe`, `status`, `run`) and calls the same `app::*` flows.
+    curl -s https://blokli-piz-palu.dev.hoprnet.link/graphql -H 'content-type: application/json' -d \
+      '{"query":"{ channels(safeAddress: \"<SAFE>\") { ... on ChannelsList { channels { source destination balance status ticketIndex } } } }"}'
 
-## Frontends
+`source`/`destination` are key ids; resolve them with `accounts(keyid: N) { ... on AccountsList { accounts { chainKey multiAddresses } } }`.
+A relay's `ticketIndex` on your channel goes up when it redeems tickets it earned forwarding your
+packets. Your own nodes show `multiAddresses: []`: nobody (including your other node) can dial them
+directly.
 
-    cargo build                      # TUI only (hoprd embedded)
-    cargo build --features cli       # TUI + line-mode CLI; run with --cli
-    cargo build --no-default-features   # spawn an external hoprd binary instead of embedding it
+**2. Your node's REST API**, with the token from `hoprd.token`:
 
-TUI: `?` help overlay, `/` opens a command palette (Tab/Enter completes, ↑↓ picks), ↑↓ switch chat,
-PgUp/PgDn scroll, Ctrl-W/Ctrl-U edit, Esc closes popups, Ctrl-C quits. Outgoing messages show `…` pending, `✓` sent, `✓✓` delivered.
+    T=$(cat ~/Library/Application\ Support/hopr-chat/hoprd.token); api() { curl -s -H "X-Auth-Token: $T" localhost:3100/api/v4/$1; }
+    api channels             # your outgoing channels (to relays)
+    api network/connected    # peers you're connected to: relays, not your chat partner
+    api session/tcp          # open sessions
 
-## Desktop app (Tauri)
+**3. On the wire.** With hops = 1, packets to your partner go to the relay's IP, never to theirs:
 
-`app/` is a Tauri v2 GUI (Svelte 5 web UI) over the same library. `app/src-tauri/src/lib.rs` has
-`TauriUi: Ui`, plus commands that the web UI calls.
+    lsof -nP -a -p $(pgrep -f hopr-chat-app) -i UDP          # find the node's UDP port
+    sudo tcpdump -ni en0 udp port <that port>                  # remote IPs = relays
 
-    cd app && npm install
-    npm run tauri dev                                    # own node (production flow, onboarding UI)
-    HOPR_CHAT_DEV_NICK=a npm run tauri dev               # localcluster node, like `hopr-chat dev`
-    HOPR_CHAT_DEV_NICK=b npm run tauri:second            # 2nd window: reuses the dev server on :1420
-    HOPR_CHAT_ATTACH_API=http://localhost:3002 HOPR_CHAT_NICK=me \
-      HOPR_CHAT_HOPRD_CONFIG=/tmp/hopr-nodes/hoprd_cfg_2.yaml npm run tauri dev   # running hoprd
-
-Other env vars: `HOPR_CHAT_HOPS`, `HOPR_CHAT_NETWORK=piz-palu|jura|rotsee`, `HOPR_CHAT_HOME`,
-`HOPR_CHAT_DEV_NODE`, `HOPR_CHAT_CLUSTER_DIR`. The GUI's dev modes (`HOPR_CHAT_DEV_NICK`) keep data in
-`~/.hopr-chat/<nick>/`.
-
-**hoprd runs inside the app** (`embedded` feature, on by default) on desktop and Android, so there is no
-sidecar to build or bundle. Its log is `hoprd.log` in the app home.
-
-## Android app
-
-Same Tauri app; hoprd runs **inside the app process** via `hoprd::main_inner`, on its own runtime.
-The chat core still talks to it over REST on `127.0.0.1`. Network: piz-palu (hopr-lib 5).
-
-Prerequisites: Android SDK (`ANDROID_HOME`), NDK r28+ (`NDK_HOME`, 16 KB pages), JDK 17,
-`rustup target add aarch64-linux-android`. On this machine:
-
-    export ANDROID_HOME=/opt/homebrew/share/android-commandlinetools
-    export NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358 JAVA_HOME=/opt/homebrew/opt/openjdk@17
-
-Build and install (phone with USB debugging on, `adb devices` lists it):
-
-    cd app
-    npx tauri android build --apk -t aarch64             # ~10 min
-    adb install -r src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk
-    adb logcat | grep RustStdoutStderr                   # core + hoprd logs
-
-**Signing = keeping your identity.** `adb install -r` upgrades in place and keeps the app data only when
-the APK is signed with the same key. The release signing key is `~/.android/hopr-chat-release.jks`; its
-passwords are in `app/src-tauri/gen/android/key.properties` (gitignored). Back both up. With another key
-the install fails, and the only way out is uninstalling, which deletes the identity.
-
-Android specifics:
-- `android_init` in `app/src-tauri/src/lib.rs` points `HOPR_CHAT_HOME` and `TMPDIR` (hoprd's ticket
-  store) into the app sandbox. It also initialises `rustls-platform-verifier` with the JVM so blokli's
-  TLS uses Android's trust store. Its Kotlin half is a Gradle dependency (`org.rustls:rustls-platform-verifier`),
-  and that version must match `rustls-platform-verifier-android` in `Cargo.lock`.
-- `NodeService` is a foreground service with an ongoing notification. It keeps the process, and so the
-  node, alive in the background.
-- Narrow screens show either the chat list or one conversation; back returns to the list.
-
-**UI features**
-- Onboarding screens: identity, Safe choice (existing or create), funding with a live balance, hoprd startup.
-- Chat list with unread counts and search (⌘K). New chat (⌘N) checks that the address is an announced node.
-- Message bubbles with sender nick, signature badge (✓ verified / unsigned / ✗ forged?) and delivery state
-  (🕓 queued, ✓ sent, ✓✓ delivered).
-- Balance chip with gas/funds warnings, a share-address dialog, and toasts.
-
-**Shutdown.** Closing the window shuts down cleanly: sessions are closed and the node is stopped.
-
-## Production (own node)
-
-    hopr-chat --network piz-palu --nick alice    # first start; later just `hopr-chat`
-
-The first start (TUI or GUI) does the following:
-
-1. Creates the node identity (`hopr.id` + generated `hopr.pass`) in the app home (see "Where things live").
-2. Finds the node's Safe:
-   - If a Safe owned by this node already exists on chain, it uses that.
-   - Otherwise it asks you:
-     - **existing**: enter the Safe and module addresses. The node must already be added to that module,
-       e.g. via the HOPR staking hub.
-     - **create**: fund the shown node address with xDai + wxHOPR. The app waits, then deploys the Safe
-       and moves the wxHOPR into it, the same way as GnosisVPN.
-3. Writes `hoprd.yaml` and starts hoprd in-process. On first start hoprd registers the node with the Safe
-   (0.01 wxHOPR from the Safe, gas from the node) and announces it on chain.
-   - The allow list contains only this chat's target (`127.0.0.1:<port derived from the address>`).
-   - The API is on 127.0.0.1 with a random token.
-   - hoprd's default strategies auto-open channels.
-
-Only for `--no-default-features` builds, an external hoprd is found in this order: `hoprd_bin` in
-settings, `HOPR_CHAT_HOPRD_BIN`, the binary next to hopr-chat, `PATH`. Settings (`nick`, `blokli_url`, `hops`, ports) live in `settings.toml`;
-the `--nick`, `--network`, `--blokli-url` and `--hops` flags update them.
-
-The p2p port (default 9100) must be reachable from the internet so relays can deliver incoming sessions.
+Strongest test: put the phone on mobile data (no Wi-Fi). Messages still arrive both ways although
+neither device can reach the other directly.
 
 ## Dev (localcluster)
 
-See the prerequisites below, then:
+A local 3-node cluster on anvil + blokli; no real funds, no internet needed. One-time setup:
 
-    cargo run -- dev --nick a     # starts the cluster if needed, attaches to node 0
+1. A running container runtime: Docker (default), OrbStack (`orbctl start`), Podman, or Apple's
+   `container`. Pick a non-docker one with `HOPRD_CONTAINER_RUNTIME=podman` (or `container`).
+2. The chain image (amd64-only, runs under Rosetta on Apple silicon; the digest is the hoprd CI pin):
+
+       docker pull --platform linux/amd64 \
+         europe-west3-docker.pkg.dev/hoprassociation/docker-images/bloklid-anvil@sha256:75956aede10a71fbb8a46fae05d1aa1caed10ae6ed410c4385df3d565b4fe4fc
+
+3. hoprd and hoprd-localcluster, built with nix in a checkout of the hoprd repo, ideally at the rev
+   pinned in `Cargo.toml`:
+
+       nix build .#binary-hoprd -o result-hoprd
+       nix build .#binary-hoprd-localcluster -o result-localcluster
+       export HOPR_CHAT_HOPRD_BIN=$PWD/result-hoprd/bin/hoprd
+       export HOPR_CHAT_LOCALCLUSTER_BIN=$PWD/result-localcluster/bin/hoprd-localcluster
+
+Then, with those two variables exported in each shell:
+
+    cargo run -- dev --nick a     # starts the cluster if needed (first time takes minutes), attaches to node 0
     cargo run -- dev --nick b     # node 1; node 2 relays (default 1 hop)
+    cargo run -- dev-down         # stops the cluster
 
-Dev mode signs with each node's key, read from `/tmp/hopr-nodes/hoprd_cfg_<id>.yaml`.
-`cargo run -- dev-down` stops the cluster.
+The GUI uses the same variables: `HOPR_CHAT_DEV_NICK=a npm run tauri dev` (see GUI above).
 
-`attach --api URL --nick n [--hoprd-config cfg.yaml]` uses any running hoprd. Messages are signed only if the
-config is given.
+Each nick sticks to the node it got first (remembered in `~/.hopr-chat/<nick>/dev-node`; the cluster
+uses frozen identities), so its address stays the same across runs; `--node <id>` overrides it. Dev
+mode signs with the node's key from `/tmp/hopr-nodes/hoprd_cfg_<id>.yaml` and keeps chat data in
+`~/.hopr-chat/<nick>/`; the cluster log is `localcluster.log` there. Free ports: 8080,
+3000-3002, 9000-9002. If the cluster gets stuck: `dev-down`, `docker rm -f hopr-chain`,
+`rm -rf /tmp/hopr-nodes`.
 
-### Prerequisites
+`attach --api URL --nick n [--hoprd-config cfg.yaml]` uses any running hoprd. Without the config its
+messages are unsigned, and contacts drop unsigned messages, so it can only talk to strangers.
 
-localcluster runs anvil + blokli in a container:
-
-    orbctl start && docker info
-    docker pull --platform linux/amd64 \
-      europe-west3-docker.pkg.dev/hoprassociation/docker-images/bloklid-anvil@sha256:75956aede10a71fbb8a46fae05d1aa1caed10ae6ed410c4385df3d565b4fe4fc
-
-The image is amd64-only and runs under Rosetta on Apple silicon; the digest is the hoprd CI pin. Build hoprd and
-hoprd-localcluster in the hoprd repo (`nix build .#binary-hoprd`, `.#binary-hoprd-localcluster`) and export
-`HOPR_CHAT_HOPRD_BIN` and `HOPR_CHAT_LOCALCLUSTER_BIN`.
-
-Free ports: 8080, 3000-3002, 9000-9002. If the cluster gets stuck:
-`dev-down`, `docker rm -f hopr-chain`, `rm -rf /tmp/hopr-nodes`.
-
-## Using it (CLI)
-
-    /add bob 0x...        save a peer (hoprd checks it is an announced node)
-    /open bob             focus; plain text now goes to bob, prompt shows a→bob>
-    /chats                conversations, unread counts
-    /history bob 50       with sender nick and ✓ (verified) / ? (unsigned) / ✗ (forged) badges
-    /balance              node + Safe balances
-    /reply 3 text         answer inbound connection #3 over SURBs (works without /add)
-    /peers /outbox /whoami /close /help /quit
-
-Tab completes commands, peers and connection ids.
-
-- **Delivery:** messages are queued in SQLite and count as delivered only on the peer's ack. Peers with
-  pending messages are redialed every 15s, and unacked messages are resent after a restart.
-- **Signatures:** each message is signed over `hopr-chat/v1|recipient|id|nick|text` with the node's chain key.
-  The receiver recovers the signer address and compares it with the claimed sender.
-
-## Releases
-
-Desktop: `cd app && npm run bundle` (one app, hoprd inside). Android: the APK above. Not done yet: a
-signed update manifest, store builds, and a faucet hook for test funds.
+`cargo build --no-default-features` spawns an external hoprd instead of embedding it, found in this
+order: `hoprd_bin` in settings, `HOPR_CHAT_HOPRD_BIN`, the binary next to hopr-chat, `PATH`.
 
 ## Limits
 
@@ -232,3 +243,8 @@ signed update manifest, store builds, and a faucet hook for test funds.
 - There is no mailbox: both sides must be online at some point.
 - An existing Safe must already include this node in its module. Otherwise hoprd fails at startup;
   check `hoprd.log`.
+- Not done yet: signed update manifest, store builds, a faucet for test funds.
+
+## License
+
+GPL-3.0-only, see [LICENSE](LICENSE) (same as hoprd and hopr-lib, which are linked in).

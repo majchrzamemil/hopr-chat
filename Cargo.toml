@@ -2,18 +2,20 @@
 name = "hopr-chat"
 version = "0.1.0"
 edition = "2021"
+description = "Anonymous P2P chat over HOPR sessions"
+license = "GPL-3.0-only"
 
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
-rustyline = { version = "14", features = ["derive"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-edgli = { git = "https://github.com/hoprnet/edge-client.git", branch = "main", default-features = false, features = ["blokli"] }
-hoprd = { git = "https://github.com/hoprnet/hoprd.git", branch = "main", default-features = false, features = ["runtime-tokio", "transport-quic", "session-server"], optional = true }
+tokio-util = { version = "0.7", features = ["codec"] }
+edgli = { git = "https://github.com/hoprnet/edge-client.git", rev = "b6614471abb975959060e86df1b0c28ce8305d07", default-features = false, features = ["blokli"] }
+hoprd = { git = "https://github.com/hoprnet/hoprd.git", rev = "ba4218327bfe24aa17e9d60fc32dcdf685d2a066", default-features = false, features = ["runtime-tokio", "transport-quic", "session-server"], optional = true }
 serde_yaml = "0.9"
 toml = "0.8"
 hex = "0.4"
@@ -22,10 +24,11 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 default = ["embedded"]
-# rustyline line-mode frontend, selected at runtime with --cli
-cli = ["dep:rustyline"]
 # hoprd runs inside this process; without it production mode spawns a hoprd binary
 embedded = ["dep:hoprd", "dep:tracing-subscriber"]
 

@@ -1,5 +1,5 @@
-//! Wires onboarding, hoprd and the chat core together behind the `Ui` trait, so the CLI can be
-//! swapped for a GUI without touching anything below this module.
+//! Wires onboarding, hoprd and the chat core together behind the `Ui` trait, so the TUI and the
+//! GUI share everything below this module.
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -52,6 +52,8 @@ pub struct ChatOpts {
     pub ack_timeout: i64,
 }
 
+pub const DEFAULT_OPTS: ChatOpts = ChatOpts { retry_secs: 15, ack_timeout: 30 };
+
 pub struct Production {
     pub home: PathBuf,
     pub nick: Option<String>,
@@ -79,7 +81,8 @@ pub struct Attach {
     pub hoprd_config: Option<PathBuf>,
 }
 
-/// Own node: onboarding on first start, then a bundled hoprd supervised as a child process.
+/// Own node: onboarding on first start, then hoprd (in-process, or a child without `embedded`).
+/// Returns only after hoprd is down, so the process can exit right after.
 pub async fn production<U: Ui>(ui: &mut U, p: Production, opts: ChatOpts) -> Result<()> {
     std::fs::create_dir_all(&p.home)?;
     let settings_path = p.home.join("settings.toml");
@@ -102,9 +105,9 @@ pub async fn production<U: Ui>(ui: &mut U, p: Production, opts: ChatOpts) -> Res
     ui.status(Status::StartingHoprd { log: log.clone() });
     let config = p.home.join(onboard::HOPRD_CONFIG);
     #[cfg(feature = "embedded")]
-    let (api, _hoprd) = hoprd::embed(keys.clone(), &config, s.api_port, &log).await?;
+    let (api, stop_hoprd) = hoprd::embed(keys.clone(), &config, s.api_port, &log).await?;
     #[cfg(not(feature = "embedded"))]
-    let (api, _hoprd) = hoprd::launch(&hoprd_bin(&s), &config, s.api_port, &log).await?;
+    let (api, stop_hoprd) = hoprd::launch(&hoprd_bin(&s), &config, s.api_port, &log).await?;
     let cfg = Config {
         nick: s.nick,
         data_dir: p.home,
@@ -113,7 +116,9 @@ pub async fn production<U: Ui>(ui: &mut U, p: Production, opts: ChatOpts) -> Res
         ack_timeout: opts.ack_timeout,
         key: Some(keys.chain_key),
     };
-    serve(ui, cfg, api).await
+    let res = serve(ui, cfg, api).await;
+    let _ = tokio::task::spawn_blocking(stop_hoprd).await;
+    res
 }
 
 /// localcluster node; the node's identity comes from the config localcluster generated for it.
@@ -121,8 +126,12 @@ pub async fn dev<U: Ui>(ui: &mut U, d: Dev, opts: ChatOpts) -> Result<()> {
     std::fs::create_dir_all(&d.data_dir)?;
     let log = d.data_dir.join("localcluster.log");
     ui.status(Status::StartingCluster { log: log.clone() });
+    // The same nick keeps the same node, and so the same address its peers saved.
+    let node_file = d.data_dir.join("dev-node");
+    let remembered = std::fs::read_to_string(&node_file).ok().and_then(|id| id.trim().parse().ok());
     let (api, id, lock) =
-        hoprd::dev_attach(&d.localcluster_bin, &d.hoprd_bin, &d.chain_image, &d.cluster_dir, &log, d.node).await?;
+        hoprd::dev_attach(&d.localcluster_bin, &d.hoprd_bin, &d.chain_image, &d.cluster_dir, &log, d.node, remembered).await?;
+    std::fs::write(&node_file, id.to_string())?;
     let key = node_key(ui, Some(d.cluster_dir.join(format!("hoprd_cfg_{id}.yaml"))));
     let cfg = Config { nick: d.nick, data_dir: d.data_dir, hops: d.hops, retry_secs: opts.retry_secs, ack_timeout: opts.ack_timeout, key };
     let res = serve(ui, cfg, api).await;

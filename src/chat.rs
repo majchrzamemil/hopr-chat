@@ -2,7 +2,7 @@
 //! public methods and render the `Event`s it emits.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
         atomic::{AtomicU32, Ordering},
@@ -11,23 +11,34 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use edgli::{
     blokli::ChainKeypair,
     hopr_lib::{api::types::crypto::prelude::Signature, builder::Keypair},
 };
+use futures::StreamExt;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::AsyncWriteExt,
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
     sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
 };
+use tokio_util::codec::{FramedRead, LinesCodec};
 
 use crate::{db, hoprd};
+
+/// Any announced node can open a session to us, so everything it sends is bounded.
+const MAX_LINE: usize = 16 * 1024;
+pub const MAX_TEXT: usize = 4000;
+const MAX_NICK: usize = 32;
+/// Unread messages kept per unknown sender; more are dropped until the conversation is read.
+const MAX_UNREAD_FROM_STRANGER: i64 = 100;
+
+type Writer = Arc<tokio::sync::Mutex<OwnedWriteHalf>>;
 
 pub struct Config {
     pub nick: String,
@@ -122,23 +133,29 @@ fn line(w: &Wire) -> Vec<u8> {
     bytes
 }
 
+pub fn is_address(s: &str) -> bool {
+    s.len() == 42 && s.starts_with("0x") && s[2..].bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Remote text ends up in terminals: control characters could drive them.
+fn clean(s: &str, keep_newlines: bool) -> String {
+    s.chars().filter(|c| !c.is_control() || (keep_newlines && *c == '\n')).collect()
+}
+
 fn new_id() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as i64
 }
 
 /// Every chat listens on a port derived from its node address, so the address alone is enough to reach it.
 pub fn chat_target(address: &str) -> String {
-    let hash = address
-        .to_lowercase()
-        .bytes()
-        .fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+    let hash = address.to_lowercase().bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
     format!("127.0.0.1:{}", 20000 + hash % 40000)
 }
 
-/// Binding the recipient and id stops replays to other peers or as new messages; the prefix keeps
-/// these signatures apart from the chain key's ticket and transaction signatures.
+/// Binding the recipient and id stops replays to other peers or as new messages. The nick is length
+/// prefixed so it cannot be shifted into the text; the tag keeps these apart from ticket signatures.
 fn signed_bytes(to: &str, id: i64, nick: &str, text: &str) -> Vec<u8> {
-    format!("hopr-chat/v1|{}|{id}|{nick}|{text}", to.to_lowercase()).into_bytes()
+    format!("hopr-chat/v2|{}|{id}|{}:{nick}|{text}", to.to_lowercase(), nick.len()).into_bytes()
 }
 
 fn sign(key: &ChainKeypair, to: &str, id: i64, nick: &str, text: &str) -> String {
@@ -158,6 +175,17 @@ fn verify(me: &str, from: &str, id: i64, nick: &str, text: &str, sig: Option<&st
     }
 }
 
+/// Conversation an incoming message is filed under, `None` to drop it. Only a verified message may
+/// land in a contact's conversation; unsigned strangers are filed by their address.
+fn conversation_for(contact: Option<String>, from: &str, verified: &str) -> Option<String> {
+    match (contact, verified) {
+        (_, "invalid") => None,
+        (Some(nick), "verified") => Some(nick),
+        (Some(_), _) => None,
+        (None, _) => Some(from.to_lowercase()),
+    }
+}
+
 pub struct Chat {
     db: Mutex<Connection>,
     api: hoprd::Api,
@@ -169,9 +197,11 @@ pub struct Chat {
     key: Option<ChainKeypair>,
     events: UnboundedSender<Event>,
     /// peer nick -> (session writer, hoprd session socket)
-    outgoing: tokio::sync::Mutex<HashMap<String, (OwnedWriteHalf, String)>>,
+    outgoing: Mutex<HashMap<String, (Writer, String)>>,
+    /// Peers whose session is being opened; the opener flushes their queue once it is up.
+    dialing: Mutex<HashSet<String>>,
     /// conn id -> (writer back over SURBs, peer label, sender address)
-    incoming: tokio::sync::Mutex<HashMap<u32, (OwnedWriteHalf, String, String)>>,
+    incoming: Mutex<HashMap<u32, (Writer, String, String)>>,
     next_conn: AtomicU32,
 }
 
@@ -201,6 +231,7 @@ pub async fn start(cfg: Config, api: hoprd::Api) -> Result<(Arc<Chat>, Unbounded
         key,
         events,
         outgoing: Default::default(),
+        dialing: Default::default(),
         incoming: Default::default(),
         next_conn: AtomicU32::new(1),
     });
@@ -231,39 +262,53 @@ impl Chat {
     }
 
     pub async fn add_peer(&self, nick: &str, address: &str) -> Result<()> {
+        anyhow::ensure!(is_address(address), "{address} is not a node address (0x + 40 hex characters)");
+        anyhow::ensure!(!address.eq_ignore_ascii_case(&self.me), "{address} is this node's own address");
+        anyhow::ensure!(!nick.is_empty() && !is_address(nick), "pick a nickname for {address}");
         self.api.ensure_announced(address).await?;
         db::add_peer(&self.db(), nick, address)
     }
 
-    /// Queues for a known peer; for a sender that was never added, answers on its live connection.
+    /// Queues for a contact. A stranger is answered on its live connection while there is one,
+    /// otherwise its conversation label is a node address and gets queued and dialed like a contact.
     pub async fn send(self: &Arc<Self>, peer: &str, text: &str) -> Result<()> {
-        if db::peer_address(&self.db(), peer)?.is_some() {
-            db::insert_out(&self.db(), peer, new_id(), text, "pending")?;
-            self.wake(peer);
-            return Ok(());
+        anyhow::ensure!(text.chars().count() <= MAX_TEXT, "message too long (max {MAX_TEXT} characters)");
+        let contact = db::peer_address(&self.db(), peer)?.is_some();
+        if !contact {
+            let conn = self.incoming.lock().unwrap().iter().find(|(_, (_, label, _))| label.eq_ignore_ascii_case(peer)).map(|(c, _)| *c);
+            if let Some(conn) = conn {
+                return self.reply(conn, text).await;
+            }
         }
-        let conn = self.incoming.lock().await.iter().find(|(_, (_, label, _))| label.eq_ignore_ascii_case(peer)).map(|(c, _)| *c);
-        match conn {
-            Some(conn) => self.reply(conn, text).await,
-            None => bail!("unknown peer {peer}: /add it, or wait until it messages you"),
-        }
+        let address = self.address_of(peer)?.with_context(|| format!("unknown peer {peer}: add it as a contact first"))?;
+        anyhow::ensure!(!address.eq_ignore_ascii_case(&self.me), "{peer} is this node's own address");
+        db::insert_out(&self.db(), peer, new_id(), text, "pending")?;
+        self.wake(peer);
+        Ok(())
     }
 
-    pub async fn reply(&self, conn: u32, text: &str) -> Result<()> {
+    /// Node address behind a conversation: the contact's, or the label itself for a stranger.
+    fn address_of(&self, peer: &str) -> Result<Option<String>> {
+        let contact = db::peer_address(&self.db(), peer)?;
+        Ok(contact.or_else(|| is_address(peer).then(|| peer.to_string())))
+    }
+
+    /// Answers a sender that is not a contact over its live connection (SURBs).
+    async fn reply(&self, conn: u32, text: &str) -> Result<()> {
         let id = new_id();
-        let mut incoming = self.incoming.lock().await;
-        let (w, label, to) = incoming.get_mut(&conn).context("connection gone, use /msg")?;
-        let sig = self.key.as_ref().map(|k| sign(k, to, id, &self.nick, text));
+        let (w, label, to) =
+            self.incoming.lock().unwrap().get(&conn).cloned().context("their connection closed: add them as a contact to reach them")?;
+        let sig = self.key.as_ref().map(|k| sign(k, &to, id, &self.nick, text));
         let msg = Wire::Msg { id, from: self.me.clone(), nick: self.nick.clone(), text: text.into(), sig };
-        w.write_all(&line(&msg)).await?;
-        db::insert_out(&self.db(), label, id, text, "sent")
+        w.lock().await.write_all(&line(&msg)).await?;
+        db::insert_out(&self.db(), &label, id, text, "sent")
     }
 
-    pub async fn peers(&self) -> Result<Vec<db::Peer>> {
-        let open = self.outgoing.lock().await;
+    pub fn peers(&self) -> Result<Vec<db::Peer>> {
+        let open: HashSet<String> = self.outgoing.lock().unwrap().keys().cloned().collect();
         let mut peers = db::peers(&self.db())?;
         for p in &mut peers {
-            p.online = open.contains_key(&p.nick);
+            p.online = open.contains(&p.nick);
         }
         Ok(peers)
     }
@@ -280,11 +325,6 @@ impl Chat {
         names
     }
 
-    /// Inbound connections that `/reply` can answer; empty while the map is busy.
-    pub fn open_connections(&self) -> Vec<u32> {
-        self.incoming.try_lock().map(|m| m.keys().copied().collect()).unwrap_or_default()
-    }
-
     pub fn conversations(&self) -> Result<Vec<db::Conversation>> {
         db::conversations(&self.db())
     }
@@ -297,10 +337,35 @@ impl Chat {
         db::history(&db, peer, address.as_deref(), n)
     }
 
-    pub fn mark_read(&self, peer: &str) -> Result<()> {
+    /// Deletes a conversation's messages (queued ones are never sent), or every message with `None`.
+    pub fn purge(&self, peer: Option<&str>) -> Result<usize> {
         let db = self.db();
-        let address = db::peer_address(&db, peer)?;
-        db::mark_read(&db, peer, address.as_deref())
+        match peer {
+            Some(peer) => {
+                let address = db::peer_address(&db, peer)?;
+                db::purge(&db, Some((peer, address.as_deref())))
+            }
+            None => db::purge(&db, None),
+        }
+    }
+
+    /// Forgets a contact: its messages are purged like `purge` and its open session is closed.
+    /// Returns the number of deleted messages.
+    /// A stranger's conversation (no contact behind it) is simply deleted.
+    pub async fn remove_peer(&self, nick: &str) -> Result<usize> {
+        let deleted = {
+            let db = self.db();
+            let address = db::peer_address(&db, nick)?;
+            let deleted = db::purge(&db, Some((nick, address.as_deref())))?;
+            let removed = db::remove_peer(&db, nick)?;
+            anyhow::ensure!(removed || deleted > 0, "no contact or conversation named {nick}");
+            deleted
+        };
+        let session = self.outgoing.lock().unwrap().remove(nick);
+        if let Some((_, sock)) = session {
+            self.api.close_session(&sock).await;
+        }
+        Ok(deleted)
     }
 
     pub fn outbox(&self) -> Result<Vec<db::Msg>> {
@@ -320,7 +385,7 @@ impl Chat {
     }
 
     pub async fn shutdown(&self) {
-        let socks: Vec<String> = self.outgoing.lock().await.drain().map(|(_, (_, s))| s).collect();
+        let socks: Vec<String> = self.outgoing.lock().unwrap().drain().map(|(_, (_, s))| s).collect();
         for s in socks {
             self.api.close_session(&s).await;
         }
@@ -337,39 +402,75 @@ impl Chat {
     fn wake(self: &Arc<Self>, peer: &str) {
         let (chat, peer) = (self.clone(), peer.to_string());
         tokio::spawn(async move {
+            // A peer removed while its dial was in flight is not worth a warning.
             if let Err(e) = chat.flush(&peer).await {
-                chat.emit(Event::Unreachable { peer, error: format!("{e:#}") });
+                if chat.address_of(&peer).is_ok_and(|a| a.is_some()) {
+                    chat.emit(Event::Unreachable { peer, error: format!("{e:#}") });
+                }
             }
         });
     }
 
     async fn flush(self: &Arc<Self>, peer: &str) -> Result<()> {
-        let pending = db::pending(&self.db(), peer)?;
-        if pending.is_empty() {
+        if db::pending(&self.db(), peer)?.is_empty() {
             return Ok(());
         }
-        let address = db::peer_address(&self.db(), peer)?.with_context(|| format!("unknown peer {peer}"))?;
-        let mut out = self.outgoing.lock().await;
-        if !out.contains_key(peer) {
-            let dialed = self.dial(&address).await;
-            db::peer_attempt(&self.db(), peer, dialed.as_ref().err().map(|e| format!("{e:#}")))?;
-            let (stream, sock) = dialed?;
-            let (r, w) = stream.into_split();
-            tokio::spawn(self.clone().read_outgoing(peer.to_string(), r, sock.clone()));
-            out.insert(peer.to_string(), (w, sock));
-        }
-        let (w, _) = out.get_mut(peer).expect("inserted above");
+        let Some(address) = self.address_of(peer)? else { return Ok(()) };
+        let writer = match self.writer(peer) {
+            Some(w) => w,
+            None => match self.connect(peer, &address).await? {
+                Some(w) => w,
+                None => return Ok(()),
+            },
+        };
+        let pending = db::pending(&self.db(), peer)?;
+        let mut w = writer.lock().await;
         for (id, text) in pending {
             let sig = self.key.as_ref().map(|k| sign(k, &address, id, &self.nick, &text));
             let msg = Wire::Msg { id, from: self.me.clone(), nick: self.nick.clone(), text, sig };
             if let Err(e) = w.write_all(&line(&msg)).await {
-                drop(out);
+                drop(w);
                 self.close_outgoing(peer, None).await;
                 return Err(e.into());
             }
             db::mark_sent(&self.db(), peer, id)?;
         }
         Ok(())
+    }
+
+    fn writer(&self, peer: &str) -> Option<Writer> {
+        self.outgoing.lock().unwrap().get(peer).map(|(w, _)| w.clone())
+    }
+
+    /// Opens the peer's session without holding the session map, so one slow peer stalls no one else.
+    /// `None` when another task is already dialing it: that task flushes the queue once connected.
+    async fn connect(self: &Arc<Self>, peer: &str, address: &str) -> Result<Option<Writer>> {
+        if !self.dialing.lock().unwrap().insert(peer.to_string()) {
+            return Ok(None);
+        }
+        if let Some(w) = self.writer(peer) {
+            self.dialing.lock().unwrap().remove(peer);
+            return Ok(Some(w));
+        }
+        let dialed = match self.dial(address).await {
+            Ok((_, sock)) if self.address_of(peer).is_ok_and(|a| a.is_none()) => {
+                self.api.close_session(&sock).await;
+                self.dialing.lock().unwrap().remove(peer);
+                return Ok(None);
+            }
+            dialed => dialed,
+        };
+        let attempt = db::peer_attempt(&self.db(), peer, dialed.as_ref().err().map(|e| format!("{e:#}")));
+        let connected = dialed.map(|(stream, sock)| {
+            let (r, w) = stream.into_split();
+            let w: Writer = Arc::new(tokio::sync::Mutex::new(w));
+            tokio::spawn(self.clone().read_outgoing(peer.to_string(), r, sock.clone()));
+            self.outgoing.lock().unwrap().insert(peer.to_string(), (w.clone(), sock));
+            Some(w)
+        });
+        self.dialing.lock().unwrap().remove(peer);
+        attempt?;
+        connected
     }
 
     async fn dial(&self, address: &str) -> Result<(TcpStream, String)> {
@@ -385,12 +486,13 @@ impl Chat {
 
     /// `sock = None` force-closes whatever session the peer has (ack timeout).
     async fn close_outgoing(&self, peer: &str, sock: Option<&str>) {
-        let mut out = self.outgoing.lock().await;
-        if sock.is_some_and(|s| out.get(peer).is_none_or(|(_, cur)| cur != s)) {
-            return;
-        }
-        let removed = out.remove(peer);
-        drop(out);
+        let removed = {
+            let mut out = self.outgoing.lock().unwrap();
+            if sock.is_some_and(|s| out.get(peer).is_none_or(|(_, cur)| cur != s)) {
+                return;
+            }
+            out.remove(peer)
+        };
         if let Some((_, s)) = removed {
             self.api.close_session(&s).await;
         }
@@ -400,14 +502,21 @@ impl Chat {
     }
 
     async fn read_outgoing(self: Arc<Self>, peer: String, r: OwnedReadHalf, sock: String) {
-        let mut lines = BufReader::new(r).lines();
-        while let Ok(Some(l)) = lines.next_line().await {
+        let mut lines = FramedRead::new(r, LinesCodec::new_with_max_length(MAX_LINE));
+        while let Some(next) = lines.next().await {
+            let l = match next {
+                Ok(l) => l,
+                Err(e) => {
+                    self.emit(Event::Warning(format!("closing session to {peer}: {e}")));
+                    break;
+                }
+            };
             match serde_json::from_str::<Wire>(&l) {
                 Ok(Wire::Ack { id }) => self.on_ack(&peer, id),
                 Ok(Wire::Msg { id, from, nick, text, sig }) => {
                     self.on_msg(None, id, &from, &nick, &text, sig.as_deref());
-                    if let Some((w, _)) = self.outgoing.lock().await.get_mut(&peer) {
-                        let _ = w.write_all(&line(&Wire::Ack { id })).await;
+                    if let Some(w) = self.writer(&peer) {
+                        let _ = w.lock().await.write_all(&line(&Wire::Ack { id })).await;
                     }
                 }
                 Err(e) => self.emit(Event::Warning(format!("bad line from {peer}: {e}"))),
@@ -419,46 +528,87 @@ impl Chat {
 
     async fn accept_loop(self: Arc<Self>, listener: TcpListener) {
         loop {
-            let Ok((stream, _)) = listener.accept().await else { continue };
+            let Ok((stream, _)) = listener.accept().await else {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            };
             let conn = self.next_conn.fetch_add(1, Ordering::Relaxed);
             let (r, w) = stream.into_split();
-            self.incoming.lock().await.insert(conn, (w, String::new(), String::new()));
+            self.incoming.lock().unwrap().insert(conn, (Arc::new(tokio::sync::Mutex::new(w)), String::new(), String::new()));
             tokio::spawn(self.clone().read_incoming(conn, r));
         }
     }
 
+    /// Rejected messages are acked too, so their sender stops resending them.
     async fn read_incoming(self: Arc<Self>, conn: u32, r: OwnedReadHalf) {
-        let mut lines = BufReader::new(r).lines();
-        while let Ok(Some(l)) = lines.next_line().await {
-            let mut incoming = self.incoming.lock().await;
-            let Some((w, label, sender)) = incoming.get_mut(&conn) else { break };
+        let mut lines = FramedRead::new(r, LinesCodec::new_with_max_length(MAX_LINE));
+        while let Some(next) = lines.next().await {
+            let l = match next {
+                Ok(l) => l,
+                Err(e) => {
+                    self.emit(Event::Warning(format!("closing connection #{conn}: {e}")));
+                    break;
+                }
+            };
             match serde_json::from_str::<Wire>(&l) {
                 Ok(Wire::Msg { id, from, nick, text, sig }) => {
-                    *label = self.on_msg(Some(conn), id, &from, &nick, &text, sig.as_deref());
-                    *sender = from;
-                    let _ = w.write_all(&line(&Wire::Ack { id })).await;
+                    let filed = self.on_msg(Some(conn), id, &from, &nick, &text, sig.as_deref());
+                    let writer = {
+                        let mut incoming = self.incoming.lock().unwrap();
+                        let Some((w, label, sender)) = incoming.get_mut(&conn) else { break };
+                        if let Some(filed) = filed {
+                            *label = filed;
+                            *sender = from.to_lowercase();
+                        }
+                        w.clone()
+                    };
+                    let _ = writer.lock().await.write_all(&line(&Wire::Ack { id })).await;
                 }
-                Ok(Wire::Ack { id }) => self.on_ack(label, id),
+                Ok(Wire::Ack { id }) => {
+                    let label = self.incoming.lock().unwrap().get(&conn).map(|(_, label, _)| label.clone());
+                    if let Some(label) = label.filter(|l| !l.is_empty()) {
+                        self.on_ack(&label, id);
+                    }
+                }
                 Err(e) => self.emit(Event::Warning(format!("bad line on #{conn}: {e}"))),
             }
         }
-        self.incoming.lock().await.remove(&conn);
+        self.incoming.lock().unwrap().remove(&conn);
     }
 
-    /// Stores and announces an incoming message, returns the peer label it was stored under.
-    fn on_msg(&self, conn: Option<u32>, id: i64, from: &str, nick: &str, text: &str, sig: Option<&str>) -> String {
+    /// Stores and announces an incoming message; returns the conversation it was filed under,
+    /// `None` when it was dropped.
+    fn on_msg(&self, conn: Option<u32>, id: i64, from: &str, nick: &str, text: &str, sig: Option<&str>) -> Option<String> {
+        if !is_address(from) {
+            self.emit(Event::Warning("dropped a message with a malformed sender address".into()));
+            return None;
+        }
+        if text.chars().count() > MAX_TEXT {
+            self.emit(Event::Warning(format!("dropped an oversized message from {from}")));
+            return None;
+        }
+        let verified = verify(&self.me, from, id, nick, text, sig);
         let db = self.db();
-        let peer = db::nick_by_address(&db, from).ok().flatten().unwrap_or_else(|| from.to_string());
+        let contact = db::nick_by_address(&db, from).ok().flatten();
+        let Some(peer) = conversation_for(contact.clone(), from, verified) else {
+            drop(db);
+            let who = contact.unwrap_or_else(|| from.to_string());
+            self.emit(Event::Warning(format!("dropped a message claiming to be {who}: signature {verified}")));
+            return None;
+        };
+        if contact.is_none() && db::unread(&db, &peer).unwrap_or(0) >= MAX_UNREAD_FROM_STRANGER {
+            return None;
+        }
         let msg = db::Msg {
             id,
             peer: peer.clone(),
             dir: "in".into(),
-            text: text.into(),
+            text: clean(text, true),
             status: "received".into(),
             created: db::now(),
-            nick: Some(nick.into()),
-            from_addr: Some(from.into()),
-            verified: Some(verify(&self.me, from, id, nick, text, sig).into()),
+            nick: Some(clean(nick, false).chars().take(MAX_NICK).collect()),
+            from_addr: Some(from.to_lowercase()),
+            verified: Some(verified.into()),
             conn,
         };
         let stored = db::insert_in(&db, &msg);
@@ -468,7 +618,7 @@ impl Chat {
             Ok(false) => {}
             Err(e) => self.emit(Event::Warning(format!("db: {e:#}"))),
         }
-        peer
+        Some(peer)
     }
 
     fn on_ack(&self, peer: &str, id: i64) {
@@ -487,11 +637,8 @@ impl Chat {
             for peer in stale {
                 self.close_outgoing(&peer, None).await;
             }
-            let due = db::peers_with_pending(&self.db()).unwrap_or_default();
-            for peer in due {
-                if let Err(e) = self.flush(&peer).await {
-                    self.emit(Event::Unreachable { peer, error: format!("{e:#}") });
-                }
+            for peer in db::peers_with_pending(&self.db()).unwrap_or_default() {
+                self.wake(&peer);
             }
             tokio::time::sleep(every).await;
         }
@@ -509,6 +656,27 @@ mod tests {
         assert_eq!(bytes.last(), Some(&b'\n'));
         assert_eq!(serde_json::from_slice::<Wire>(&bytes).unwrap(), msg);
         assert_eq!(serde_json::from_str::<Wire>(r#"{"t":"ack","id":5}"#).unwrap(), Wire::Ack { id: 5 });
+    }
+
+    #[test]
+    fn only_verified_messages_reach_a_contact() {
+        let addr = "0xAbCdEf0000000000000000000000000000000001";
+        let bob = || Some("bob".to_string());
+        assert_eq!(conversation_for(bob(), addr, "verified"), Some("bob".into()));
+        assert_eq!(conversation_for(bob(), addr, "unsigned"), None);
+        assert_eq!(conversation_for(bob(), addr, "invalid"), None);
+        assert_eq!(conversation_for(None, addr, "invalid"), None);
+        assert_eq!(conversation_for(None, addr, "unsigned"), Some(addr.to_lowercase()));
+    }
+
+    #[test]
+    fn remote_input_is_validated() {
+        assert!(is_address("0x00000000000000000000000000000000000000aB"));
+        assert!(!is_address("bob"));
+        assert!(!is_address("0xaéééééééééééééééééééééééééééééééééééé"));
+        assert!(!is_address("0x00000000000000000000000000000000000000a"));
+        assert_eq!(clean("hi\x1b[2J\nthere\r", true), "hi[2J\nthere");
+        assert_eq!(clean("al\nice", false), "alice");
     }
 
     #[test]
@@ -549,5 +717,7 @@ mod tests {
         assert_eq!(verify(&a, &a, 7, "alice", "hi", Some(&sig)), "invalid");
         assert_eq!(verify(&b, &a, 7, "alice", "hi", Some("zz")), "invalid");
         assert_eq!(verify(&b, &a, 7, "alice", "hi", None), "unsigned");
+        let shifted = sign(&alice, &b, 7, "al", "ice|hi");
+        assert_eq!(verify(&b, &a, 7, "al|ice", "hi", Some(&shifted)), "invalid");
     }
 }

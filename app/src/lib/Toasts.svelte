@@ -17,15 +17,20 @@
 <style>
   .stack {
     position: fixed;
-    right: 16px;
-    bottom: 16px;
+    left: 12px;
+    right: 12px;
+    bottom: calc(16px + env(safe-area-inset-bottom));
     display: flex;
     flex-direction: column;
+    align-items: flex-end;
     gap: 8px;
     z-index: 30;
-    max-width: 380px;
+    pointer-events: none;
   }
   .toast {
+    max-width: min(380px, 100%);
+    overflow-wrap: anywhere;
+    pointer-events: auto;
     display: flex;
     align-items: center;
     gap: 8px;
