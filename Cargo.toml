@@ -15,7 +15,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 edgli = { git = "https://github.com/hoprnet/edge-client.git", rev = "b6614471abb975959060e86df1b0c28ce8305d07", default-features = false, features = ["blokli"] }
-hoprd = { git = "https://github.com/hoprnet/hoprd.git", rev = "ba4218327bfe24aa17e9d60fc32dcdf685d2a066", default-features = false, features = ["runtime-tokio", "transport-quic", "session-server"], optional = true }
+hoprd = { git = "https://github.com/hoprnet/hoprd.git", rev = "227e0c2d787cf77d040c203e75a3e4e45e1821b0", default-features = false, features = ["runtime-tokio", "transport-quic", "session-server"], optional = true }
 serde_yaml = "0.9"
 toml = "0.8"
 hex = "0.4"
@@ -46,5 +46,5 @@ debug = false
 # edgli follows hoprnet `master`, hoprd pins a rev: one hopr-lib so their types are shared.
 # `www.` makes it a distinct source, cargo refuses patches pointing at the patched URL.
 [patch."https://github.com/hoprnet/hoprnet"]
-hopr-lib = { git = "https://www.github.com/hoprnet/hoprnet", rev = "6c66dddd6130cd99c1824b34894438e254b288c4" }
-hopr-utils-session = { git = "https://www.github.com/hoprnet/hoprnet", rev = "6c66dddd6130cd99c1824b34894438e254b288c4" }
+hopr-lib = { git = "https://www.github.com/hoprnet/hoprnet", rev = "77f0e221a1bfb3964f7f4f492706baa91418697f" }
+hopr-utils-session = { git = "https://www.github.com/hoprnet/hoprnet", rev = "77f0e221a1bfb3964f7f4f492706baa91418697f" }

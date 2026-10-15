@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// `(name, blokli url)`; the first is the default. hopr-lib 5 only talks to v5 networks.
-pub const NETWORKS: [(&str, &str); 1] = [("piz-palu", "https://blokli-piz-palu.dev.hoprnet.link")];
+pub const NETWORKS: [(&str, &str); 1] = [("piz-palu-prod", "https://blokli-piz-palu.prod.hoprnet.link")];
 
 pub fn blokli_url(network: &str) -> Option<String> {
     NETWORKS.iter().find(|(name, _)| *name == network).map(|(_, url)| url.to_string())

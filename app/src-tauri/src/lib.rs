@@ -126,7 +126,8 @@ async fn run_core(ui: &mut TauriUi) -> Result<()> {
         };
         return app::attach(ui, attach, opts).await;
     }
-    let blokli_url = env("HOPR_CHAT_NETWORK").and_then(|n| settings::blokli_url(&n));
+    // No network picker in the GUI: always the build's default network.
+    let blokli_url = Some(settings::NETWORKS[0].1.to_string());
     let production = app::Production { home: settings::home()?, nick: env("HOPR_CHAT_NICK"), blokli_url, hops };
     app::production(ui, production, opts).await
 }

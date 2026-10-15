@@ -34,7 +34,7 @@ second refuses to start (`port 3100 is busy: is hopr-chat (TUI or desktop app) a
    - The REST API listens on 127.0.0.1 with a random token.
    - hoprd's default strategies auto-open channels.
 
-Network is piz-palu (HOPR v5, Gnosis Chain). Settings (`nick`, `blokli_url`, `hops`, ports) live in
+Network is piz-palu-prod (HOPR v5, Gnosis Chain). Settings (`nick`, `blokli_url`, `hops`, ports) live in
 `settings.toml`; `--nick`, `--network`, `--blokli-url` and `--hops` update them.
 
 The p2p port (default 9100, UDP) does not need to be reachable from the internet: a node behind NAT
@@ -82,7 +82,7 @@ Other modes, picked by environment variables:
     HOPR_CHAT_ATTACH_API=http://localhost:3002 HOPR_CHAT_NICK=me \
       HOPR_CHAT_HOPRD_CONFIG=/tmp/hopr-nodes/hoprd_cfg_2.yaml npm run tauri dev   # running hoprd
 
-Also: `HOPR_CHAT_HOPS`, `HOPR_CHAT_NETWORK`, `HOPR_CHAT_HOME`, `HOPR_CHAT_DEV_NODE`,
+Also: `HOPR_CHAT_HOPS`, `HOPR_CHAT_HOME`, `HOPR_CHAT_DEV_NODE`,
 `HOPR_CHAT_CLUSTER_DIR`. Dev modes keep data in `~/.hopr-chat/<nick>/`.
 
 ## Android
@@ -157,7 +157,7 @@ The in-app "Create a new Safe" makes one Safe per node, owned by that node's key
 between your nodes, create it with hopli (`hoprnet/hopli`):
 
     PRIVATE_KEY=<gas-only deployer key> hopli safe-module create \
-      --network piz-palu-dev --provider-url https://rpc.gnosischain.com \
+      --network piz-palu-prod --provider-url https://rpc.gnosischain.com \
       --node-address <node1>,<node2> \
       --admin-address <owner> --threshold 1 --allowance 100
 
@@ -173,7 +173,7 @@ between your nodes, create it with hopli (`hoprnet/hopli`):
 
 **1. On chain (no node access needed).** Your Safe's payment channels to relays, from blokli:
 
-    curl -s https://blokli-piz-palu.dev.hoprnet.link/graphql -H 'content-type: application/json' -d \
+    curl -s https://blokli-piz-palu.prod.hoprnet.link/graphql -H 'content-type: application/json' -d \
       '{"query":"{ channels(safeAddress: \"<SAFE>\") { ... on ChannelsList { channels { source destination balance status ticketIndex } } } }"}'
 
 `source`/`destination` are key ids; resolve them with `accounts(keyid: N) { ... on AccountsList { accounts { chainKey multiAddresses } } }`.

@@ -88,7 +88,11 @@ pub async fn production<U: Ui>(ui: &mut U, p: Production, opts: ChatOpts) -> Res
     let settings_path = p.home.join("settings.toml");
     let mut s = settings::load(&settings_path)?.unwrap_or_else(|| Settings::new(default_nick()));
     s.nick = p.nick.unwrap_or(s.nick);
-    s.blokli_url = p.blokli_url.unwrap_or(s.blokli_url);
+    if let Some(url) = p.blokli_url.filter(|url| *url != s.blokli_url) {
+        // The chain index belongs to the old network; hoprd rebuilds it from blokli.
+        let _ = std::fs::remove_dir_all(p.home.join("hoprd-db"));
+        s.blokli_url = url;
+    }
     s.hops = p.hops.unwrap_or(s.hops);
     settings::save(&settings_path, &s)?;
     // TUI and GUI share this home and its node, so only one of them may run at a time.

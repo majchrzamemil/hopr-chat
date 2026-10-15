@@ -171,8 +171,8 @@ the new nick.
   direct and not anonymous). Each relay only knows its neighbours.
 - **Payment**: every relayed packet carries a ticket drawn on a **payment channel** from the sender to
   the first relay. The channel strategy opens channels from the Safe to a few relays and sizes them by
-  traffic (`initial_capacity`, 1 GiB). On piz-palu one ticket is 1e-16 wxHOPR, so a channel holds about
-  1.4e-10 wxHOPR.
+  traffic (`initial_capacity`, 1 GiB). On piz-palu-prod a ticket costs 1e-5 wxHOPR at win probability
+  ~4e-6, so a winning ticket is worth ~2.5 wxHOPR.
 - **Funds**: the **Safe** holds wxHOPR and gives the Channels contract an allowance. The **node
   address** only holds xDai for gas. Registering a node with a Safe costs 0.01 wxHOPR.
 - **Reachability**: nodes behind NAT announce no address. Peers and relays reach them over connections
@@ -240,8 +240,9 @@ Making it *run* inside an app took the following, all in `android_init()` and th
 
 ## Networks
 
-`settings::NETWORKS` maps a name to a blokli URL. The only entry is **piz-palu** (HOPR v5, Gnosis
-Chain, contracts `piz-palu-dev`), which matches hopr-lib 5; older networks speak another protocol.
+`settings::NETWORKS` maps a name to a blokli URL. The only entry is **piz-palu-prod** (HOPR v5, Gnosis
+Chain), which matches hopr-lib 5; older networks speak another protocol. A changed blokli URL wipes
+`hoprd-db`; the Safe must already be scoped for the new network's contracts.
 
 ## Known limits
 

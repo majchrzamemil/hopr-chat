@@ -117,7 +117,8 @@ async fn main() -> Result<()> {
     match cli.cmd {
         None => {
             let p = cli.prod;
-            let blokli_url = p.blokli_url.or(p.network.and_then(|n| settings::blokli_url(&n)));
+            let network = p.network.unwrap_or(settings::NETWORKS[0].0.to_string());
+            let blokli_url = p.blokli_url.or(settings::blokli_url(&network));
             let home = match p.home {
                 Some(h) => h,
                 None => settings::home()?,
