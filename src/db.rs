@@ -29,6 +29,8 @@ pub struct Peer {
     pub last_seen: Option<i64>,
     pub last_attempt: Option<i64>,
     pub last_err: Option<String>,
+    /// Relay hops each way; the configured default for contacts saved without one.
+    pub hops: u8,
     /// Filled by the chat core: an outgoing session is open.
     pub online: bool,
 }
@@ -58,7 +60,7 @@ pub fn init(db: &Connection) -> Result<()> {
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS peers (
             nick TEXT PRIMARY KEY, address TEXT NOT NULL,
-            last_seen INTEGER, last_attempt INTEGER, last_err TEXT);
+            last_seen INTEGER, last_attempt INTEGER, last_err TEXT, hops INTEGER);
          CREATE TABLE IF NOT EXISTS messages (
             id INTEGER NOT NULL, peer TEXT NOT NULL, dir TEXT NOT NULL, text TEXT NOT NULL,
             status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
@@ -70,36 +72,56 @@ pub fn init(db: &Connection) -> Result<()> {
         let _ = db.execute(&format!("ALTER TABLE messages ADD COLUMN {col}"), []);
     }
     let _ = db.execute("ALTER TABLE peers DROP COLUMN target", []);
+    let _ = db.execute("ALTER TABLE peers ADD COLUMN hops INTEGER", []);
     // sessions don't survive a restart, so anything in flight must be resent
     db.execute("UPDATE messages SET status = 'pending' WHERE dir = 'out' AND status = 'sent'", [])?;
     Ok(())
 }
 
-pub fn add_peer(db: &Connection, nick: &str, address: &str) -> Result<()> {
+pub fn add_peer(db: &Connection, nick: &str, address: &str, hops: u8) -> Result<()> {
     db.execute(
-        "INSERT INTO peers (nick, address) VALUES (?1, ?2)
-         ON CONFLICT(nick) DO UPDATE SET address = ?2",
-        params![nick, address],
+        "INSERT INTO peers (nick, address, hops) VALUES (?1, ?2, ?3)
+         ON CONFLICT(nick) DO UPDATE SET address = ?2, hops = ?3",
+        params![nick, address, hops],
     )?;
     // messages from/to this node stored before it had a nick
     db.execute("UPDATE OR IGNORE messages SET peer = ?1 WHERE lower(peer) = lower(?2)", params![nick, address])?;
     Ok(())
 }
 
+/// Messages stored under the bare address: someone who wrote before being saved as a contact.
+pub fn has_conversation(db: &Connection, address: &str) -> Result<bool> {
+    Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE lower(peer) = lower(?1))", [address], |r| r.get(0))?)
+}
+
 pub fn remove_peer(db: &Connection, nick: &str) -> Result<bool> {
     Ok(db.execute("DELETE FROM peers WHERE nick = ?1", params![nick])? > 0)
 }
 
-pub fn peers(db: &Connection) -> Result<Vec<Peer>> {
-    let mut stmt = db.prepare("SELECT nick, address, last_seen, last_attempt, last_err FROM peers ORDER BY nick")?;
-    let rows = stmt.query_map([], |r| {
-        Ok(Peer { nick: r.get(0)?, address: r.get(1)?, last_seen: r.get(2)?, last_attempt: r.get(3)?, last_err: r.get(4)?, online: false })
+pub fn peers(db: &Connection, default_hops: u8) -> Result<Vec<Peer>> {
+    let mut stmt =
+        db.prepare("SELECT nick, address, last_seen, last_attempt, last_err, COALESCE(hops, ?1) FROM peers ORDER BY nick")?;
+    let rows = stmt.query_map([default_hops], |r| {
+        Ok(Peer {
+            nick: r.get(0)?,
+            address: r.get(1)?,
+            last_seen: r.get(2)?,
+            last_attempt: r.get(3)?,
+            last_err: r.get(4)?,
+            hops: r.get(5)?,
+            online: false,
+        })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
 pub fn peer_address(db: &Connection, nick: &str) -> Result<Option<String>> {
     Ok(db.query_row("SELECT address FROM peers WHERE nick = ?1", [nick], |r| r.get(0)).optional()?)
+}
+
+/// `None` for a stranger or a contact saved before hops were per contact.
+pub fn peer_hops(db: &Connection, nick: &str) -> Result<Option<u8>> {
+    Ok(db.query_row("SELECT hops FROM peers WHERE nick = ?1", [nick], |r| r.get(0)).optional()?.flatten())
 }
 
 pub fn nick_by_address(db: &Connection, address: &str) -> Result<Option<String>> {
@@ -266,7 +288,7 @@ mod tests {
     fn mem() -> Connection {
         let db = Connection::open_in_memory().unwrap();
         init(&db).unwrap();
-        add_peer(&db, "b", "0xB").unwrap();
+        add_peer(&db, "b", "0xB", 1).unwrap();
         db
     }
 
@@ -294,7 +316,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("chat.db");
         let db = open(&path).unwrap();
-        add_peer(&db, "b", "0xB").unwrap();
+        add_peer(&db, "b", "0xB", 1).unwrap();
         insert_out(&db, "b", 1, "SECRET-to-b", "pending").unwrap();
         insert_in(&db, &incoming("0xb", 2, "SECRET-from-b")).unwrap();
         insert_out(&db, "c", 3, "keep-for-c", "pending").unwrap();
@@ -316,10 +338,32 @@ mod tests {
     #[test]
     fn remove_peer_keeps_others() {
         let db = mem();
-        add_peer(&db, "c", "0xC").unwrap();
+        add_peer(&db, "c", "0xC", 1).unwrap();
         assert!(remove_peer(&db, "b").unwrap());
         assert!(!remove_peer(&db, "b").unwrap());
-        assert_eq!(peers(&db).unwrap().iter().map(|p| p.nick.as_str()).collect::<Vec<_>>(), ["c"]);
+        assert_eq!(peers(&db, 1).unwrap().iter().map(|p| p.nick.as_str()).collect::<Vec<_>>(), ["c"]);
+    }
+
+    #[test]
+    fn saving_a_stranger_moves_its_conversation() {
+        let db = mem();
+        insert_in(&db, &incoming("0xAbC", 1, "hi")).unwrap();
+        assert!(has_conversation(&db, "0xabc").unwrap());
+        add_peer(&db, "carol", "0xABC", 1).unwrap();
+        assert!(!has_conversation(&db, "0xabc").unwrap());
+        assert_eq!(history(&db, "carol", Some("0xABC"), 10).unwrap()[0].text, "hi");
+    }
+
+    #[test]
+    fn hops_are_per_contact_with_default_for_old_rows() {
+        let db = mem();
+        add_peer(&db, "c", "0xC", 3).unwrap();
+        db.execute("INSERT INTO peers (nick, address) VALUES ('old', '0xD')", []).unwrap();
+        assert_eq!(peer_hops(&db, "c").unwrap(), Some(3));
+        assert_eq!(peer_hops(&db, "old").unwrap(), None);
+        assert_eq!(peer_hops(&db, "stranger").unwrap(), None);
+        let hops: Vec<u8> = peers(&db, 2).unwrap().iter().map(|p| p.hops).collect();
+        assert_eq!(hops, [1, 3, 2]); // b from mem(), c, old
     }
 
     #[test]
@@ -398,7 +442,7 @@ mod tests {
         )
         .unwrap();
         init(&db).unwrap();
-        add_peer(&db, "b", "0xB").unwrap();
+        add_peer(&db, "b", "0xB", 1).unwrap();
         insert_in(&db, &incoming("b", 1, "x")).unwrap();
         assert_eq!(conversations(&db).unwrap()[0].unread, 1);
     }

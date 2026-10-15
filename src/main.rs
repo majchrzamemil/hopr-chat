@@ -33,7 +33,7 @@ struct ProdArgs {
     /// Saved to settings; overrides --network
     #[arg(long)]
     blokli_url: Option<String>,
-    /// Saved to settings. Relay hops both ways; 0 is direct and NOT anonymous
+    /// Saved to settings. Default relay hops for new contacts; `/add` can pick per contact
     #[arg(long)]
     hops: Option<u8>,
 }

@@ -167,8 +167,8 @@ the new nick.
 
 ## What HOPR provides (and what it costs)
 
-- **Sessions**: hopr-lib sends the stream as SPHINX packets over `hops` relays (1 by default; 0 is
-  direct and not anonymous). Each relay only knows its neighbours.
+- **Sessions**: hopr-lib sends the stream as SPHINX packets over the contact's `hops` relays (per
+  contact, saved in `peers.hops`; settings `hops` is the default, 1; 0 is direct and not anonymous). Each relay only knows its neighbours.
 - **Payment**: every relayed packet carries a ticket drawn on a **payment channel** from the sender to
   the first relay. The channel strategy opens channels from the Safe to a few relays and sizes them by
   traffic: 10 MiB per channel (`write_hoprd_config`; hoprd's default is 1 GiB, sized for VPN). On

@@ -34,6 +34,8 @@ use crate::{db, hoprd};
 /// Any announced node can open a session to us, so everything it sends is bounded.
 const MAX_LINE: usize = 16 * 1024;
 pub const MAX_TEXT: usize = 4000;
+/// HOPR paths carry at most 3 relays.
+pub const MAX_HOPS: u8 = 3;
 const MAX_NICK: usize = 32;
 /// Unread messages kept per unknown sender; more are dropped until the conversation is read.
 const MAX_UNREAD_FROM_STRANGER: i64 = 100;
@@ -43,6 +45,7 @@ type Writer = Arc<tokio::sync::Mutex<OwnedWriteHalf>>;
 pub struct Config {
     pub nick: String,
     pub data_dir: PathBuf,
+    /// Relay hops each way for contacts added without their own.
     pub hops: u8,
     pub retry_secs: u64,
     pub ack_timeout: i64,
@@ -261,12 +264,26 @@ impl Chat {
         self.key.is_some()
     }
 
-    pub async fn add_peer(&self, nick: &str, address: &str) -> Result<()> {
+    pub async fn add_peer(&self, nick: &str, address: &str, hops: Option<u8>) -> Result<()> {
         anyhow::ensure!(is_address(address), "{address} is not a node address (0x + 40 hex characters)");
         anyhow::ensure!(!address.eq_ignore_ascii_case(&self.me), "{address} is this node's own address");
         anyhow::ensure!(!nick.is_empty() && !is_address(nick), "pick a nickname for {address}");
-        self.api.ensure_announced(address).await?;
-        db::add_peer(&self.db(), nick, address)
+        let hops = hops.unwrap_or(self.hops);
+        anyhow::ensure!(hops <= MAX_HOPS, "hops must be 0-{MAX_HOPS}");
+        // Someone who already wrote to us is reachable, announced or not (phones announce no address).
+        if !db::has_conversation(&self.db(), address)? {
+            self.api.ensure_announced(address).await?;
+        }
+        db::add_peer(&self.db(), nick, address, hops)?;
+        for (_, label, _) in self.incoming.lock().unwrap().values_mut() {
+            if label.eq_ignore_ascii_case(address) {
+                *label = nick.to_string();
+            }
+        }
+        // An open session keeps its old path or label; the next message redials with these hops.
+        self.close_outgoing(nick, None).await;
+        self.close_outgoing(address, None).await;
+        Ok(())
     }
 
     /// Queues for a contact. A stranger is answered on its live connection while there is one,
@@ -306,7 +323,7 @@ impl Chat {
 
     pub fn peers(&self) -> Result<Vec<db::Peer>> {
         let open: HashSet<String> = self.outgoing.lock().unwrap().keys().cloned().collect();
-        let mut peers = db::peers(&self.db())?;
+        let mut peers = db::peers(&self.db(), self.hops)?;
         for p in &mut peers {
             p.online = open.contains(&p.nick);
         }
@@ -316,7 +333,7 @@ impl Chat {
     /// Known peer nicks plus labels of conversations with senders that were never added.
     pub fn peer_names(&self) -> Vec<String> {
         let db = self.db();
-        let mut names: Vec<String> = db::peers(&db).unwrap_or_default().into_iter().map(|p| p.nick).collect();
+        let mut names: Vec<String> = db::peers(&db, self.hops).unwrap_or_default().into_iter().map(|p| p.nick).collect();
         for c in db::conversations(&db).unwrap_or_default() {
             if !names.contains(&c.peer) {
                 names.push(c.peer);
@@ -452,7 +469,8 @@ impl Chat {
             self.dialing.lock().unwrap().remove(peer);
             return Ok(Some(w));
         }
-        let dialed = match self.dial(address).await {
+        let hops = db::peer_hops(&self.db(), peer).ok().flatten().unwrap_or(self.hops);
+        let dialed = match self.dial(address, hops).await {
             Ok((_, sock)) if self.address_of(peer).is_ok_and(|a| a.is_none()) => {
                 self.api.close_session(&sock).await;
                 self.dialing.lock().unwrap().remove(peer);
@@ -473,8 +491,8 @@ impl Chat {
         connected
     }
 
-    async fn dial(&self, address: &str) -> Result<(TcpStream, String)> {
-        let sock = self.api.open_session(address, &chat_target(address), self.hops).await?;
+    async fn dial(&self, address: &str, hops: u8) -> Result<(TcpStream, String)> {
+        let sock = self.api.open_session(address, &chat_target(address), hops).await?;
         match TcpStream::connect(&sock).await {
             Ok(stream) => Ok((stream, sock)),
             Err(e) => {

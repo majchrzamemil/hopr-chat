@@ -9,6 +9,7 @@
 
   let convs = $state([]);
   let names = $state([]);
+  let peers = $state([]);
   let selected = $state(null);
   let msgs = $state([]);
   let wallet = $state(null);
@@ -19,6 +20,7 @@
   let purgePeer = $state(null); // conversation to purge; null = every conversation
   let newNick = $state("");
   let newAddress = $state("");
+  let newHops = $state(""); // "" = the configured default
   let adding = $state(false);
   let scroller = $state();
   let composer = $state();
@@ -36,6 +38,9 @@
     return q ? list.filter((c) => c.peer.toLowerCase().includes(q)) : list;
   });
 
+  /** The add form opened from a stranger's chat: the address is theirs and fixed. */
+  const saving = $derived(modal === "add" && selected !== null && isAddress(selected) && newAddress === selected);
+  const selectedHops = $derived(peers.find((p) => p.nick === selected)?.hops);
   const critical = $derived(wallet?.warnings.some(([c]) => c));
 
   /** Groups consecutive messages by day for date separators. */
@@ -53,7 +58,7 @@
 
   async function loadChats() {
     try {
-      [convs, names] = await Promise.all([api.conversations(), api.peerNames()]);
+      [convs, names, peers] = await Promise.all([api.conversations(), api.peerNames(), api.peers()]);
       if (!selected && !narrow && chats.length) await open(chats[0].peer);
     } catch (e) {
       toast(String(e), "error");
@@ -108,14 +113,20 @@
     }
   }
 
+  function saveContact() {
+    newNick = newHops = "";
+    newAddress = selected;
+    modal = "add";
+  }
+
   async function addPeer(e) {
     e.preventDefault();
     adding = true;
     try {
-      await api.addPeer(newNick, newAddress);
+      await api.addPeer(newNick, newAddress, newHops === "" ? null : Number(newHops));
       modal = null;
       const nick = newNick.trim();
-      newNick = newAddress = "";
+      newNick = newAddress = newHops = "";
       await loadChats();
       await open(nick);
       toast(`Added ${nick}`, "success", null, 2500);
@@ -247,9 +258,6 @@
       <span class="badge {info.signing ? 'ok' : 'warn'}" title={info.signing ? "Messages are signed with your node key" : "No node key: messages are unsigned"}>
         {info.signing ? "✓ signed" : "unsigned"}
       </span>
-      <span class="badge {info.hops === 0 ? 'bad' : ''}" title="Relay hops each way">
-        {info.hops === 0 ? "0 hops · not anonymous" : `${info.hops} hop${info.hops === 1 ? "" : "s"}`}
-      </span>
     </div>
 
     <div class="search">
@@ -303,6 +311,14 @@
             <span class="muted small">Not in your contacts. Replies go to this node address.</span>
           {/if}
         </div>
+        {#if selectedHops !== undefined}
+          <span class="badge {selectedHops === 0 ? 'bad' : ''}" title="Relay hops each way for this contact">
+            {selectedHops === 0 ? "0 hops · not anonymous" : `${selectedHops} hop${selectedHops === 1 ? "" : "s"}`}
+          </span>
+        {/if}
+        {#if isAddress(selected)}
+          <button class="ghost clear" title="Save this sender as a contact" onclick={saveContact}>Save contact</button>
+        {/if}
         <button class="ghost clear" title="Delete this conversation's messages" onclick={() => askPurge(selected)}>Clear</button>
         {#if !isAddress(selected)}
           <button class="ghost clear" title="Delete this contact and its messages" onclick={() => (modal = "remove")}>Delete contact</button>
@@ -373,14 +389,26 @@
 </div>
 
 {#if modal === "add"}
-  <Modal title="New chat" onclose={() => (modal = null)}>
+  <Modal title={saving ? "Save contact" : "New chat"} onclose={() => (modal = null)}>
     <form class="form" onsubmit={addPeer}>
       <label>Nickname <input bind:value={newNick} placeholder="bob" spellcheck="false" /></label>
-      <label>Node address <input bind:value={newAddress} placeholder="0x…" spellcheck="false" class="mono" /></label>
-      <p class="muted small">Ask your peer for their address (Share my address). The node must be announced on the network.</p>
+      <label>Node address <input bind:value={newAddress} placeholder="0x…" spellcheck="false" class="mono" readonly={saving} /></label>
+      <label>
+        Relay hops
+        <select bind:value={newHops}>
+          <option value="">Default ({info.hops})</option>
+          <option value="0">0 · direct, NOT anonymous</option>
+          <option value="1">1</option>
+          <option value="2">2</option>
+          <option value="3">3</option>
+        </select>
+      </label>
+      {#if !saving}
+        <p class="muted small">Ask your peer for their address (Share my address). The node must be announced on the network.</p>
+      {/if}
       <div class="row end">
         <button type="button" class="ghost" onclick={() => (modal = null)}>Cancel</button>
-        <button class="primary" disabled={adding || !newNick.trim() || !isAddress(newAddress)}>{adding ? "Checking…" : "Add"}</button>
+        <button class="primary" disabled={adding || !newNick.trim() || !isAddress(newAddress)}>{adding ? "Checking…" : saving ? "Save" : "Add"}</button>
       </div>
     </form>
   </Modal>

@@ -35,7 +35,9 @@ second refuses to start (`port 3100 is busy: is hopr-chat (TUI or desktop app) a
    - hoprd's default strategies auto-open channels.
 
 Network is piz-palu-prod (HOPR v5, Gnosis Chain). Settings (`nick`, `blokli_url`, `hops`, ports) live in
-`settings.toml`; `--nick`, `--network`, `--blokli-url` and `--hops` update them.
+`settings.toml`; `--nick`, `--network`, `--blokli-url` and `--hops` update them. `hops` is only the default
+for new contacts: each contact keeps its own (`/add <nick> <0xaddress> [hops]`, or Relay hops in the GUI's
+New chat), 0-3, where 0 is direct and not anonymous.
 
 The p2p port (default 9100, UDP) does not need to be reachable from the internet: a node behind NAT
 announces no address and is reached through relays over connections it opened itself.
@@ -46,6 +48,7 @@ announces no address and is reached through relays over connections it opened it
 Ctrl-W/Ctrl-U edit, Esc closes popups, Ctrl-C quits.
 
     /add bob 0x...     save a contact (hoprd checks it is an announced node)
+    /save <nick> [hops] save the open stranger's chat as a contact
     /peers             contacts and their reachability
     /balance           node and Safe balances
     /whoami            the /add line to give to others
@@ -60,7 +63,8 @@ sender's node) or `?` (unsigned).
 - **Signatures:** a message from a contact must carry a valid signature from the contact's node,
   otherwise it is dropped. Unsigned messages are accepted only from strangers (not in your contacts),
   and show up under the sender's address. Replies to a stranger go back over its open connection, or,
-  once that is gone, to its node address like to a contact. `/remove` on a stranger's chat deletes it.
+  once that is gone, to its node address like to a contact. `/remove` on a stranger's chat deletes it;
+  `/save <nick> [hops]` (GUI: Save contact) turns it into a contact and keeps the messages.
 
 ## GUI
 

@@ -90,6 +90,7 @@ button:disabled {
 }
 
 input,
+select,
 textarea {
   font: inherit;
   color: var(--text);
@@ -101,6 +102,7 @@ textarea {
 }
 
 input:focus,
+select:focus,
 textarea:focus {
   border-color: var(--accent);
 }

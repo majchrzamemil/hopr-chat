@@ -8,7 +8,7 @@ export const api = {
   peerNames: () => invoke("peer_names"),
   history: (peer, limit = 500) => invoke("history", { peer, limit }),
   send: (peer, text) => invoke("send", { peer, text }),
-  addPeer: (nick, address) => invoke("add_peer", { nick, address }),
+  addPeer: (nick, address, hops) => invoke("add_peer", { nick, address, hops }),
   peers: () => invoke("peers"),
   wallet: () => invoke("wallet"),
   /** Deletes one conversation's messages, or all messages when `peer` is null. */

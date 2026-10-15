@@ -3,11 +3,12 @@
 //! a one-line hint bar with short-lived toasts, and popups drawn over a cleared area.
 
 use std::{
+    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use crossterm::event::{Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
 use hopr_chat::{
@@ -27,7 +28,8 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use crate::term::{self, ago};
 
 const COMMANDS: &[(&str, &str, &str)] = &[
-    ("/add", "<nick> <0xaddress>", "save a peer by its hoprd node address"),
+    ("/add", "<nick> <0xaddress> [hops]", "save a peer by its hoprd node address; hops 0-3 (default from settings)"),
+    ("/save", "<nick> [hops]", "save the open chat's sender (shown by address) as a contact"),
     ("/peers", "", "known peers and their reachability"),
     ("/balance", "", "node and Safe balances"),
     ("/whoami", "", "your /add line to share with others"),
@@ -85,6 +87,8 @@ struct App {
     chat: Arc<Chat>,
     /// (label, unread, last text): conversations first, then peers without messages.
     chats: Vec<(String, i64, String)>,
+    /// Contact nick -> relay hops; strangers are absent.
+    hops: HashMap<String, u8>,
     list: ListState,
     msgs: Vec<db::Msg>,
     /// Lines scrolled up from the bottom of the conversation.
@@ -102,6 +106,7 @@ impl App {
         Self {
             chat,
             chats: vec![],
+            hops: HashMap::new(),
             list: ListState::default(),
             msgs: vec![],
             scroll: 0,
@@ -154,6 +159,7 @@ impl App {
             }
         }
         self.chats = chats;
+        self.hops = self.chat.peers().unwrap_or_default().into_iter().map(|p| (p.nick, p.hops)).collect();
         let index = selected.and_then(|s| self.chats.iter().position(|(p, ..)| *p == s));
         self.list.select(index.or((!self.chats.is_empty()).then_some(0)));
         self.msgs = match self.selected().map(str::to_string) {
@@ -286,14 +292,30 @@ impl App {
             Some("/help") => self.popup = Some(Popup::Help),
             Some("/add") => {
                 let (Some(nick), Some(address)) = (words.next(), words.next()) else {
-                    bail!("usage: /add <nick> <0xaddress>");
+                    bail!("usage: /add <nick> <0xaddress> [hops]");
                 };
-                self.chat.add_peer(nick, address).await?;
+                let hops = words.next().map(|h| h.parse::<u8>().context("hops must be a number 0-3")).transpose()?;
+                self.chat.add_peer(nick, address, hops).await?;
                 self.reload();
                 if let Some(i) = self.chats.iter().position(|(p, ..)| p == nick) {
                     self.list.select(Some(i));
                 }
-                self.toast(format!("added {nick}"), Color::Green);
+                let hops = self.hops.get(nick).copied().unwrap_or_default();
+                self.toast(format!("added {nick} ({hops} hop{})", if hops == 1 { "" } else { "s" }), Color::Green);
+            }
+            Some("/save") => {
+                let Some(address) = self.selected().filter(|p| is_address(p)).map(str::to_string) else {
+                    bail!("open a chat with someone not in your contacts (shown by address) first");
+                };
+                let Some(nick) = words.next() else { bail!("usage: /save <nick> [hops]") };
+                let hops = words.next().map(|h| h.parse::<u8>().context("hops must be a number 0-3")).transpose()?;
+                self.chat.add_peer(nick, &address, hops).await?;
+                self.reload();
+                if let Some(i) = self.chats.iter().position(|(p, ..)| p == nick) {
+                    self.list.select(Some(i));
+                    self.reload();
+                }
+                self.toast(format!("saved {address} as {nick}"), Color::Green);
             }
             Some("/peers") => {
                 let lines = self
@@ -303,9 +325,14 @@ impl App {
                     .map(|p| {
                         let state = if p.online { "session".green() } else { "idle".dim() };
                         let seen = p.last_seen.map_or("never".into(), ago);
+                        let hops = match p.hops {
+                            0 => "0 hops NOT anonymous ".red(),
+                            n => format!("{n} hop{} ", if n == 1 { "" } else { "s" }).into(),
+                        };
                         Line::from(vec![
                             format!("{:<12} ", p.nick).cyan(),
                             format!("{} ", p.address).into(),
+                            hops,
                             state,
                             format!("  seen {seen}").dim(),
                         ])
@@ -374,6 +401,7 @@ impl App {
                 };
                 self.chat.send(&peer, line).await?;
                 self.scroll = 0;
+                self.reload();
             }
         }
         Ok(false)
@@ -409,16 +437,10 @@ impl App {
 
     fn draw_header(&self, f: &mut Frame, area: Rect) {
         let signing = if self.chat.signing() { " signed ".black().on_green() } else { " UNSIGNED ".black().on_yellow() };
-        let hops = match self.chat.hops() {
-            0 => " 0 hops · NOT anonymous ".black().on_red(),
-            n => format!(" {n} hop{} ", if n == 1 { "" } else { "s" }).black().on_blue(),
-        };
         let mut spans = vec![
             format!(" {} ", self.chat.nick()).black().on_cyan().bold(),
             format!(" {} ", self.chat.me()).dim(),
             signing,
-            " ".into(),
-            hops,
         ];
         match &self.wallet {
             Some(w) => {
@@ -459,7 +481,7 @@ impl App {
             .collect();
         let block = Block::bordered().border_type(BorderType::Rounded).title(" chats ");
         if items.is_empty() {
-            let hint = Paragraph::new(vec![Line::from("no chats yet".dim()), Line::from(""), Line::from("/add <nick> <0xaddr>".cyan())])
+            let hint = Paragraph::new(vec![Line::from("no chats yet".dim()), Line::from(""), Line::from("/add <nick> <0xaddr> [hops]".cyan())])
                 .block(block)
                 .wrap(Wrap { trim: true });
             f.render_widget(hint, area);
@@ -473,7 +495,13 @@ impl App {
     }
 
     fn draw_conversation(&mut self, f: &mut Frame, area: Rect) {
-        let title = self.selected().map_or(" ".to_string(), |p| format!(" {p} "));
+        let mut title = Line::from(self.selected().map_or(" ".to_string(), |p| format!(" {p} ")));
+        match self.selected().and_then(|p| self.hops.get(p)) {
+            Some(0) => title.push_span(" 0 hops · NOT anonymous ".black().on_red()),
+            Some(n) => title.push_span(format!("· {n} hop{} ", if *n == 1 { "" } else { "s" }).dim()),
+            None if self.selected().is_some_and(is_address) => title.push_span("· not a contact, /save <nick> ".yellow()),
+            None => {}
+        }
         let block = Block::bordered().border_type(BorderType::Rounded).title(title);
         let lines: Vec<Line> = self.msgs.iter().map(|m| msg_line(m, self.chat.nick())).collect();
         let empty = lines.is_empty();
@@ -489,7 +517,7 @@ impl App {
                 None => vec![
                     Line::from("Welcome to hopr-chat".bold()),
                     Line::from(""),
-                    Line::from(vec!["/add <nick> <0xaddress>".cyan(), " to start a chat".dim()]),
+                    Line::from(vec!["/add <nick> <0xaddress> [hops]".cyan(), " to start a chat".dim()]),
                     Line::from(vec!["/whoami".cyan(), " to get the line others need to reach you".dim()]),
                     Line::from(vec!["?".cyan(), " for all keys".dim()]),
                 ],
@@ -544,7 +572,7 @@ impl App {
             return;
         }
         let height = completions.len() as u16 + 2;
-        let area = Rect { x: input.x + 1, y: input.y.saturating_sub(height), width: input.width.saturating_sub(2).min(72), height };
+        let area = Rect { x: input.x + 1, y: input.y.saturating_sub(height), width: input.width.saturating_sub(2).min(96), height };
         let selected = self.completion % completions.len();
         let rows = completions.iter().enumerate().map(|(i, (cmd, args, help))| {
             let row = Row::new(vec![cmd.to_string(), args.to_string(), help.to_string()]);
@@ -554,7 +582,7 @@ impl App {
                 row
             }
         });
-        let table = Table::new(rows, [Constraint::Length(9), Constraint::Length(20), Constraint::Min(10)])
+        let table = Table::new(rows, [Constraint::Length(9), Constraint::Length(26), Constraint::Min(10)])
             .block(Block::bordered().border_type(BorderType::Rounded).title(" commands · Tab complete ").border_style(Style::new().cyan()));
         f.render_widget(Clear, area);
         f.render_widget(table, area);
@@ -566,12 +594,12 @@ fn draw_help(f: &mut Frame) {
     lines.extend(KEYS.iter().map(|(k, d)| Line::from(vec![format!("  {k:<16}").yellow(), (*d).into()])));
     lines.push(Line::from(""));
     lines.push(Line::from("Commands".bold().cyan()));
-    lines.extend(COMMANDS.iter().map(|(c, a, d)| Line::from(vec![format!("  {c:<9}").yellow(), format!("{a:<20} ").dim(), (*d).into()])));
+    lines.extend(COMMANDS.iter().map(|(c, a, d)| Line::from(vec![format!("  {c:<9}").yellow(), format!("{a:<26} ").dim(), (*d).into()])));
     lines.push(Line::from(""));
     lines.push(Line::from("Badges: ✓ signed by the sender's node · ? unsigned (only strangers may skip signing)".dim()));
     lines.push(Line::from("Sent: … pending · ✓ sent · ✓✓ delivered".dim()));
     let height = lines.len() as u16 + 4;
-    draw_popup(f, " help · Esc to close ", lines, 76, height);
+    draw_popup(f, " help · Esc to close ", lines, 110, height);
 }
 
 fn draw_popup(f: &mut Frame, title: &str, lines: Vec<Line<'static>>, width: u16, height: u16) {

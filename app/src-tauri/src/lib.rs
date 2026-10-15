@@ -175,8 +175,8 @@ async fn send(shared: State<'_, Arc<Shared>>, peer: String, text: String) -> Cmd
 }
 
 #[tauri::command]
-async fn add_peer(shared: State<'_, Arc<Shared>>, nick: String, address: String) -> CmdResult<()> {
-    chat(&shared)?.add_peer(nick.trim(), address.trim()).await.map_err(err)
+async fn add_peer(shared: State<'_, Arc<Shared>>, nick: String, address: String, hops: Option<u8>) -> CmdResult<()> {
+    chat(&shared)?.add_peer(nick.trim(), address.trim(), hops).await.map_err(err)
 }
 
 #[tauri::command]
