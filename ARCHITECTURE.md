@@ -171,8 +171,9 @@ the new nick.
   direct and not anonymous). Each relay only knows its neighbours.
 - **Payment**: every relayed packet carries a ticket drawn on a **payment channel** from the sender to
   the first relay. The channel strategy opens channels from the Safe to a few relays and sizes them by
-  traffic (`initial_capacity`, 1 GiB). On piz-palu-prod a ticket costs 1e-5 wxHOPR at win probability
-  ~4e-6, so a winning ticket is worth ~2.5 wxHOPR.
+  traffic: 10 MiB per channel (`write_hoprd_config`; hoprd's default is 1 GiB, sized for VPN). On
+  piz-palu-prod a ticket costs 1e-5 wxHOPR at win probability ~4e-6, so the stake hits its floor of one
+  3-hop winning ticket, 7.5 wxHOPR per channel (1 GiB would be ~30).
 - **Funds**: the **Safe** holds wxHOPR and gives the Channels contract an allowance. The **node
   address** only holds xDai for gas. Registering a node with a Safe costs 0.01 wxHOPR.
 - **Reachability**: nodes behind NAT announce no address. Peers and relays reach them over connections

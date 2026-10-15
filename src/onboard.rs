@@ -105,8 +105,8 @@ async fn deploy<U: Ui>(ui: &mut U, ops: &dyn IncentiveOperations, address: &str)
     Ok(Safe { safe_address: deployed.safe_address.to_string(), module_address: deployed.module_address.to_string() })
 }
 
-/// Rewritten on every start so new defaults reach existing installs. Unset sections keep hoprd defaults
-/// (including its channel lifecycle strategy).
+/// Rewritten on every start so new defaults reach existing installs. Unset sections keep hoprd defaults.
+/// Strategies mirror hoprd's, but channels are sized for chat text: 10 MiB instead of 1 GiB.
 pub fn write_hoprd_config(home: &Path, s: &Settings, password: &str, safe: &Safe, chat_target: &str) -> Result<()> {
     let cfg = json!({
         "hopr": {
@@ -119,6 +119,17 @@ pub fn write_hoprd_config(home: &Path, s: &Settings, password: &str, safe: &Safe
         "api": { "enable": true, "host": { "address": { "IPv4": "127.0.0.1" }, "port": s.api_port } },
         "session_ip_forwarding": { "use_target_allow_list": true, "target_allow_list": [chat_target] },
         "blokli_url": s.blokli_url,
+        "strategy": {
+            "allow_recursive": false,
+            "strategies": [
+                { "AutoRedeeming": { "redeem_on_winning": true } },
+                { "ChannelLifecycle": { "funding": {
+                    "initial_capacity": "10 MiB",
+                    "topup_capacity": "10 MiB",
+                    "lower_capacity_threshold": "2 MiB",
+                } } },
+            ],
+        },
     });
     let path = home.join(HOPRD_CONFIG);
     let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)?;
@@ -141,6 +152,23 @@ mod tests {
         assert_eq!(yaml["session_ip_forwarding"]["use_target_allow_list"], true);
         assert_eq!(yaml["hopr"]["safe_module"]["module_address"], "0xmodule");
         assert_eq!(yaml["identity"]["password"], "pw");
+        assert_eq!(yaml["strategy"]["strategies"][1]["ChannelLifecycle"]["funding"]["initial_capacity"], "10 MiB");
+    }
+
+    #[cfg(feature = "embedded")]
+    #[test]
+    fn hoprd_accepts_our_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let safe = Safe { safe_address: "0x7d29ab501243c6e09cfa40affe932525c26e59bb".into(), module_address: "0x2bf21ad945be6ea92222f6b14bfe94bf225c3883".into() };
+        write_hoprd_config(dir.path(), &Settings::new("a".into()), "pw", &safe, "127.0.0.1:25000").unwrap();
+        let path = dir.path().join(HOPRD_CONFIG);
+        let args = <hoprd::cli::CliArgs as clap::Parser>::try_parse_from(["hoprd", "--configurationFilePath", path.to_str().unwrap()]).unwrap();
+        let cfg = hoprd::config::HoprdConfig::try_from(args).unwrap();
+        let lifecycle = cfg.strategy.strategies.iter().find_map(|s| match s {
+            hoprd::strategy::StrategyKind::ChannelLifecycle(c) => Some(c),
+            _ => None,
+        });
+        assert_eq!(lifecycle.unwrap().funding.initial_capacity.as_u64(), 10 * 1024 * 1024);
     }
 }
 
